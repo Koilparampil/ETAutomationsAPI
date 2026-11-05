@@ -1,0 +1,10 @@
+{"Preferences": {"Id": "1", "SyncToken": "12", "sparse": false,
+  "EmailMessagesPrefs": {
+    "InvoiceMessage": {"Subject": "Invoice [Invoice No.] from [Company Name]",
+                       "Message": "Dear [Customer Name],\n\nHere's your invoice! We appreciate your prompt payment.\n\nThanks for your business!\n[Company Name]"},
+    "EstimateMessage": {"Subject": "Estimate [Estimate No.] from [Company Name]", "Message": "…"}},
+  "SalesFormsPrefs": {"ETransactionAttachPDF": true, "CustomTxnNumbers": true,
+                      "SalesEmailBcc": {"Address": "accounting@example.com"}},
+  "OtherPrefs": {"NameValue": [{"Name": "SalesFormsPrefs.DefaultCustomerMessage", "Value": "Thank you"}]},
+  "MetaData": {"CreateTime": "2020-01-01T00:00:00-08:00", "LastUpdatedTime": "2026-11-01T00:00:00-08:00"}},
+ "time": "2026-11-05T06:30:00.000-08:00"}

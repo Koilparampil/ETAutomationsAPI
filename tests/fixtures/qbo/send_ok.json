@@ -1,0 +1,1 @@
+{"Invoice": {"Id": "190613", "SyncToken": "9", "DocNumber": "EBKG12345678 A", "EmailStatus": "EmailSent", "BillEmail": {"Address": "ap@acme.example, ops@acme.example"}, "DeliveryInfo": {"DeliveryType": "Email", "DeliveryTime": "2026-11-05T06:32:10-08:00"}}, "time": "…"}

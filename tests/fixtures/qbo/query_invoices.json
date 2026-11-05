@@ -1,0 +1,23 @@
+{"QueryResponse": {"Invoice": [
+  {"Id": "190613", "SyncToken": "7", "DocNumber": "EBKG12345678", "TxnDate": "2026-10-20",
+   "DueDate": "2026-11-19", "TotalAmt": 2450.0, "Balance": 2450.0, "Deposit": 0,
+   "CustomerRef": {"value": "58", "name": "Acme Imports LLC"},
+   "BillEmail": {"Address": "ap@acme.example, ops@acme.example"},
+   "BillEmailCc": {"Address": "cc@acme.example"}, "EmailStatus": "NeedToSend",
+   "CustomField": [
+     {"DefinitionId": "1", "Name": "Container No.", "Type": "StringType", "StringValue": "MSCU1234567"},
+     {"DefinitionId": "1000000003", "Name": "ETA", "Type": "DateType", "DateValue": "2026-11-02"}],
+   "LinkedTxn": [], "MetaData": {"CreateTime": "2026-10-20T09:12:00-07:00", "LastUpdatedTime": "2026-10-28T10:00:00-07:00"}},
+  {"Id": "190700", "SyncToken": "2", "DocNumber": "EBKG23456789 A", "TotalAmt": 1875.5, "Balance": 875.5,
+   "CustomerRef": {"value": "61", "name": "Beta Freight Co"}, "BillEmail": {"Address": "billing@beta.example"},
+   "EmailStatus": "EmailSent", "DeliveryInfo": {"DeliveryType": "Email", "DeliveryTime": "2026-10-30T08:00:00-07:00"},
+   "CustomField": [{"DefinitionId": "1", "Name": "Container No.", "Type": "StringType", "StringValue": "MSCU7654321"}],
+   "LinkedTxn": [{"TxnId": "8812", "TxnType": "Payment"}]},
+  {"Id": "190801", "SyncToken": "0", "DocNumber": "267546627", "TotalAmt": 3200.0, "Balance": 0,
+   "CustomerRef": {"value": "70", "name": "Gamma Trading"}, "BillEmail": {"Address": "ap@gamma.example"},
+   "CustomField": [{"DefinitionId": "1000000003", "Name": "ETA", "Type": "DateType"}]},
+  {"Id": "190900", "SyncToken": "1", "DocNumber": "NAM1234567", "TotalAmt": 5000, "Balance": 5000,
+   "CustomerRef": {"value": "71", "name": "Delta"}},
+  {"Id": "190901", "SyncToken": "1", "DocNumber": "NAM1234567", "TotalAmt": 5000, "Balance": 5000,
+   "CustomerRef": {"value": "71", "name": "Delta"}}
+ ], "startPosition": 1, "maxResults": 5}, "time": "2026-11-05T06:30:00.000-08:00"}

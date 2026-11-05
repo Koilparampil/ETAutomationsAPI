@@ -1,0 +1,10 @@
+{"Invoice": {"Id": "190613", "SyncToken": "8", "DocNumber": "EBKG12345678 A", "TxnDate": "2026-10-20",
+   "DueDate": "2026-11-19", "TotalAmt": 2450.0, "Balance": 2450.0, "Deposit": 0,
+   "CustomerRef": {"value": "58", "name": "Acme Imports LLC"},
+   "BillEmail": {"Address": "ap@acme.example, ops@acme.example"},
+   "BillEmailCc": {"Address": "cc@acme.example"}, "EmailStatus": "NeedToSend",
+   "CustomField": [
+     {"DefinitionId": "1", "Name": "Container No.", "Type": "StringType", "StringValue": "MSCU1234567"},
+     {"DefinitionId": "1000000003", "Name": "ETA", "Type": "DateType", "DateValue": "2026-11-04"}],
+   "LinkedTxn": [], "MetaData": {"CreateTime": "2026-10-20T09:12:00-07:00", "LastUpdatedTime": "2026-11-05T06:31:00-08:00"}},
+ "time": "2026-11-05T06:31:00.000-08:00"}

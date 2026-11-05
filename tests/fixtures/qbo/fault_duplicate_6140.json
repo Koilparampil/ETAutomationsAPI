@@ -1,0 +1,1 @@
+{"Fault": {"Error": [{"Message": "Duplicate Document Number Error", "Detail": "Duplicate Document Number Error : You must specify a different number. This number has already been used. DocNumber=EBKG12345678 A is assigned to TxnType=Invoice with TxnId=180001", "code": "6140", "element": ""}], "type": "ValidationFault"}, "time": "…"}

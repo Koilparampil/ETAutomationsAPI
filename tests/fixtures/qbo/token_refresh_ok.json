@@ -1,0 +1,2 @@
+{"token_type": "bearer", "access_token": "AT-NEW-123", "expires_in": 3600,
+ "refresh_token": "RT-NEW-456", "x_refresh_token_expires_in": 8726400}

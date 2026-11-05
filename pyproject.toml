@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eta-automations"
+version = "1.0.0"
+description = "Browser-free ETAutomations: carrier ETAs via official APIs, QuickBooks Online invoice updates and e-mails, VShipCRM notes"
+readme = "README.md"
+requires-python = ">=3.12"
+# 03-foundations §2 (minimum versions, no exact pins). pandas is imported lazily by business_days.py only;
+# tzdata provides IANA zones for zoneinfo on Windows (09 §A.3.3).
+dependencies = [
+    "httpx>=0.28,<1",
+    "python-dotenv>=1.0",
+    "pandas>=2.2",
+    "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+# 04b's graph/smtp e-mail strategies use httpx and the standard library (smtplib), so no extra is needed.
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "respx>=0.22",
+]
+
+[project.scripts]
+eta = "eta_automations.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "live: optional smoke test against real services; skipped unless ETA_LIVE_TESTS=1 (12-testing §5)",
+]
