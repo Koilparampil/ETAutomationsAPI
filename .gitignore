@@ -1,0 +1,29 @@
+# Secrets — never commit
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+dist/
+build/
+
+# Program output (see spec/01-business-rules.md §14 and spec/10-pipeline.md)
+reports/
+logs/
+*.log
+Send2Ben.txt
+Send2Bindu.csv
+Send2Accounting.txt
+Failed_To_Process.txt
+PotentialCustomsHold.txt
+ToEmail_*.csv
+
+# Input files with customer data
+invoice_numbers*.csv
+
+# NOTE: do NOT ignore *.json — tests/fixtures/**/*.json are part of the program.
