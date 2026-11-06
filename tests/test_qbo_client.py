@@ -962,34 +962,102 @@ async def test_read_only_client_never_restores_the_template_but_warns(make_setti
     assert any("may still be modified" in m for m in caplog.messages)
 
 
-@pytest.mark.parametrize(("content", "error_type", "message"), [
-    (json.dumps({"realm_id": "999", "original_subject": ORIGINAL_SUBJECT}), EmailPathUnavailableError,
-     "recovery file belongs to another QuickBooks company: {path}"),
-    ("{not json", TemplateRestoreError, "The e-mail template recovery file {path} is not valid JSON."),
-    ("[]", TemplateRestoreError, "The e-mail template recovery file {path} has an unexpected format."),
-    (json.dumps({"realm_id": REALM}), TemplateRestoreError, "The recovery file {path} has no original subject"),
-], ids=["another company", "not JSON", "not an object", "no original subject"])
-async def test_a_recovery_file_this_company_cannot_use_is_flagged(make_settings, state_dir, caplog, content: str,
-                                                                  error_type: type[Exception], message: str) -> None:
-    """NEW-03: recover_email_template() marks the errors where the recovery file itself is the problem (another
-    company's file, or one that cannot be read): only a run that e-mails through template_swap must stop for them.
-    Closing the client leaves the file alone with a WARNING, not an ERROR that would call this company's template
-    broken."""
+@pytest.mark.parametrize("realm", ["999", 999], ids=["text", "number"])
+async def test_a_recovery_file_of_another_company_is_flagged(make_settings, state_dir, caplog, realm: Any) -> None:
+    """NEW-03 / R2-03: recover_email_template() marks the error about a readable recovery file of another QuickBooks
+    company (the exact 04b §6.2 step 1 text): it says nothing about this company's template, so only a run that
+    e-mails through template_swap must stop for it. Closing the client leaves the file alone with a WARNING, not an
+    ERROR that would call this company's template broken."""
+    from eta_automations.qbo.email import RECOVERY_FILE_NAME
+
+    caplog.set_level(logging.WARNING, logger="eta")
+    path = state_dir / RECOVERY_FILE_NAME
+    path.write_text(json.dumps({"realm_id": realm, "original_subject": ORIGINAL_SUBJECT}), encoding="utf-8")
+    client = make_client(make_settings(GRAPH_ENV), state_dir=state_dir)
+    with respx.mock(assert_all_mocked=True):
+        with pytest.raises(EmailPathUnavailableError) as info:
+            await client.recover_email_template()
+        await client.aclose()
+    assert str(info.value) == f"recovery file belongs to another QuickBooks company: {path}"
+    assert not isinstance(info.value, TemplateRestoreError)
+    assert getattr(info.value, "recovery_file_unusable", None) is True
+    assert path.exists()
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert any(str(path) in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+
+
+CHECK_BY_HAND = ("Check the invoice e-mail subject in QuickBooks (Settings → Account and settings → Sales → Messages), "
+                 "then delete the file.")
+
+
+@pytest.mark.parametrize(("content", "message"), [
+    ("{not json", "The e-mail template recovery file {path} is not valid JSON. " + CHECK_BY_HAND),
+    (b"\xff\xfe{", "The e-mail template recovery file {path} cannot be read (UnicodeDecodeError). " + CHECK_BY_HAND),
+    (None, "The e-mail template recovery file {path} cannot be read ("),
+    ("[]", ("The e-mail template recovery file {path} has an unexpected format. Check the invoice e-mail subject "
+            "in QuickBooks, then delete the file.")),
+    (json.dumps({"realm_id": REALM}),
+     ("The recovery file {path} has no original subject — check the invoice e-mail subject in QuickBooks (Settings → "
+      "Account and settings → Sales → Messages), then delete the file.")),
+    (json.dumps({"realm_id": REALM, "original_subject": ""}), "The recovery file {path} has no original subject — "),
+    (json.dumps({"original_subject": ORIGINAL_SUBJECT, "swapped_subject": SWAPPED_SUBJECT}),
+     "The e-mail template recovery file {path} names no QuickBooks company. " + CHECK_BY_HAND),
+    (json.dumps({"realm_id": " ", "original_subject": ORIGINAL_SUBJECT}),
+     "The e-mail template recovery file {path} names no QuickBooks company. " + CHECK_BY_HAND),
+], ids=["not JSON", "not UTF-8", "a directory", "not an object", "no original subject", "empty original subject",
+        "no company", "blank company"])
+async def test_a_damaged_recovery_file_or_one_without_an_original_subject_is_not_flagged(
+        make_settings, state_dir, caplog, content: str | bytes | None, message: str) -> None:
+    """R2-03: only another company's readable file says nothing about this company's template. A file that cannot be
+    read or is damaged — e.g. names no company — and this company's file without an original subject are left by a
+    template_swap run of this company that crashed between swap and restore, as far as anyone can tell: its invoice
+    e-mail subject may still name another customer's booking and cannot be restored automatically. Such an error is not
+    flagged, so every run reports it (banner, exit 4) with what to do, and closing the client logs it as an ERROR."""
+    from eta_automations.qbo.email import RECOVERY_FILE_NAME
+
+    caplog.set_level(logging.WARNING, logger="eta")
+    path = state_dir / RECOVERY_FILE_NAME
+    if content is None:
+        path.mkdir()
+    elif isinstance(content, bytes):
+        path.write_bytes(content)
+    else:
+        path.write_text(content, encoding="utf-8")
+    client = make_client(make_settings(GRAPH_ENV), state_dir=state_dir)
+    with respx.mock(assert_all_mocked=True):
+        with pytest.raises(TemplateRestoreError) as info:
+            await client.recover_email_template()
+        await client.aclose()
+    assert str(info.value).startswith(message.format(path=path)), str(info.value)
+    assert str(info.value).endswith("then delete the file.")
+    assert getattr(info.value, "recovery_file_unusable", None) is False
+    assert path.exists()
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1 and str(path) in errors[0], errors
+
+
+@pytest.mark.parametrize(("content", "reason"), [
+    (json.dumps({"original_subject": ORIGINAL_SUBJECT}), "names no QuickBooks company. " + CHECK_BY_HAND),
+    (json.dumps({"realm_id": REALM}), "has no original subject — check the invoice e-mail subject in QuickBooks"),
+    (json.dumps({"realm_id": "999", "original_subject": ORIGINAL_SUBJECT}), "belongs to another QuickBooks company"),
+], ids=["no company", "no original subject", "another company"])
+async def test_the_template_swap_strategy_names_what_is_wrong_with_the_recovery_file_at_close(
+        make_settings, state_dir, caplog, content: str, reason: str) -> None:
+    """R2-03: a client whose template_swap strategy refused to send for its recovery file (04b §6.2 step 1) says at
+    close why the file was left as it is; a file that names no company is damaged, not another company's."""
     from eta_automations.qbo.email import RECOVERY_FILE_NAME
 
     caplog.set_level(logging.WARNING, logger="eta")
     path = state_dir / RECOVERY_FILE_NAME
     path.write_text(content, encoding="utf-8")
-    client = make_client(make_settings(GRAPH_ENV), state_dir=state_dir)
+    client = make_client(make_settings(), state_dir=state_dir)
     with respx.mock(assert_all_mocked=True):
-        with pytest.raises(error_type) as info:
-            await client.recover_email_template()
+        with pytest.raises(EmailPathUnavailableError):
+            await client.prepare_for_sending()
         await client.aclose()
-    assert str(info.value).startswith(message.format(path=path))
-    assert getattr(info.value, "recovery_file_unusable", None) is True
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1 and str(path) in errors[0] and reason in errors[0], errors
     assert path.exists()
-    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
-    assert any(str(path) in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
 
 
 async def test_a_failed_restore_of_this_company_s_template_is_not_flagged(make_settings, state_dir, load_fixture,

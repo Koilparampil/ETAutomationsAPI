@@ -391,6 +391,8 @@ class _Run:
         self._services: Services | None = None
         self._send_turn: asyncio.Lock | None = None        # NEW-01: one template_swap e-mail at a time (Phase 4)
         self._sigint_guard: _SigintGuard | None = None     # NEW-01: Ctrl+C only repeats the stop message
+        self._console_best_effort = False                  # R2-01: set once Phase 4 begins, and on Ctrl+C (_print)
+        self._console_failed = False
 
     # ── services shortcuts ──
     @property
@@ -412,8 +414,21 @@ class _Run:
 
     # ── console ──
     def _print(self, text: str = "") -> None:
-        print(text, file=self.out if self.out is not None else sys.stdout, flush=True)
+        """One console line, also logged at DEBUG (so the log file has it). Review fix R2-01: once Phase 4 has begun
+        changing things, and on every Ctrl+C path, the console is best effort. A stream that fails — stdout of
+        `eta run … | tee run.log` whose reader ended with the same Ctrl+C, a redirect to a full disk, a closed stream —
+        never stops the apply, the Ctrl+C drain or the final report; its first failure is logged as a WARNING. Before
+        Phase 4 a failing console still stops the run, while nothing has been changed."""
         log.debug("%s", text)
+        try:
+            print(text, file=self.out if self.out is not None else sys.stdout, flush=True)
+        except (OSError, ValueError) as exc:
+            if not self._console_best_effort:
+                raise
+            if not self._console_failed:
+                self._console_failed = True
+                log.warning("Console output failed (%s: %s); the run goes on without it - see the run report and the "
+                            "log file.", type(exc).__name__, exc)
 
     def _phase_done(self, name: str) -> None:
         now = time.perf_counter()
@@ -440,8 +455,8 @@ class _Run:
             return await self._run_phases(injected)
         finally:
             if self._sigint_guard is not None:
-                # NEW-01: after a Ctrl+C during apply, Ctrl+C only repeated the stop message until the report was
-                # rewritten, the clients closed and the lock released; now it is back to normal.
+                # NEW-01 / R2-02: from the start of Phase 4 until the report was rewritten, the clients closed and the
+                # lock released, only the first Ctrl+C stopped the run; now Ctrl+C is back to normal.
                 self._sigint_guard.restore()
 
     async def _run_phases(self, injected: Services | None) -> RunSummary:
@@ -523,6 +538,7 @@ class _Run:
             self._phase_done("plan")
             code = await self._review()
         except asyncio.CancelledError:
+            self._console_best_effort = True        # R2-01: a Ctrl+C ends as one (exit code 3) without a console too
             self._print("\nInterrupted before anything was changed.")
             raise
         self._phase_done("review")
@@ -994,17 +1010,19 @@ class _Run:
         left swapped by a crashed template_swap run is restored before the prompt. The template_swap preflight does it
         for runs that send through template_swap; this covers the others — nothing to e-mail, --no-email,
         QB_EMAIL_STRATEGY=graph/smtp — so the company-wide subject never keeps naming another customer's booking.
-        A dry run only warns; a failed restore is printed with the manual instructions and makes the run exit 4.
-        A recovery file this company cannot use (another company's, or unreadable: review fix NEW-03) says nothing
-        about this company's template and does not touch these runs: a WARNING names it and the run goes on (a run
-        that e-mails through template_swap is stopped by its preflight instead, 04b §6.2 step 1)."""
+        A dry run only warns; a failed restore is printed with the manual instructions and makes the run exit 4. So
+        does a recovery file that cannot be read or is damaged, or this company's file without an original subject
+        (review fix R2-03): this company's subject may still name another customer's booking, and a person must check
+        it in QuickBooks and delete the file. Only a readable file of another QuickBooks company (review fix NEW-03)
+        says nothing about this company's template and does not touch these runs: a WARNING names it and the run goes
+        on (a run that e-mails through template_swap is stopped by its preflight instead, 04b §6.2 step 1)."""
         qbo_settings = self.settings.qbo
         recovery = self.settings.run.state_dir / RECOVERY_FILE_NAME
         if qbo_settings is None or not recovery.exists():
             return
         if self.dry_run:
             self._print(f"Warning: the QuickBooks invoice e-mail subject may still be modified by a crashed run "
-                        f"({recovery}); a real run restores it before its prompt.")
+                        f"({recovery}); a real run restores it before its prompt, or says why it cannot.")
             return
         if template_swap_preflight_ran and qbo_settings.email_strategy == "template_swap":
             return
@@ -1075,6 +1093,13 @@ class _Run:
     # Phase 4 — apply
     # ════════════════════════════════════════════════════════════════════════════════════════════
     async def _apply(self) -> None:
+        self._console_best_effort = True    # R2-01: from here on a failing console never stops the run (_print)
+        task = asyncio.current_task()
+        assert task is not None
+        # R2-02: from now until the run has ended, the first Ctrl+C still stops the run (step 3) and any other one only
+        # repeats the stop message; in place before any row task exists, put back by execute() on every exit path.
+        self._sigint_guard = _SigintGuard(asyncio.get_running_loop(), task, self._say_stopping)
+        self._sigint_guard.install()
         for row in self.rows:                                                               # step 1
             plan = row.plan
             if plan.actions or row.after is not None:      # NEW-02: a held entry waits for its booking's notice
@@ -1105,28 +1130,28 @@ class _Run:
         self._settle_held(interrupted=False)
 
     async def _drain(self, tasks: list[asyncio.Task[None]]) -> None:
-        """Phase 4 step 3 after Ctrl+C (review fixes RUL-01, NEW-01). Says at once that the started changes are being
-        finished and that Ctrl+C must not be pressed again; until the run has ended a further Ctrl+C only repeats that
-        (asyncio.run() would turn it into KeyboardInterrupt and cancel every task, the shielded writes included).
-        Plans not started yet stop, e-mails still waiting for their template_swap turn are withdrawn (nothing has
-        been written for them), and every started action finishes with the revert or note that keeps its notice whole
-        (_settle_interrupted). A further cancellation of this task changes nothing."""
-        self._print("\n" + self._stop_message())
-        if self._sigint_guard is None:
-            self._sigint_guard = _SigintGuard(asyncio.get_running_loop(),
-                                              lambda: self._print("\n" + self._stop_message()))
-            self._sigint_guard.install()
+        """Phase 4 step 3 after Ctrl+C (review fixes RUL-01, NEW-01, R2-01). Says at once that the started changes are
+        being finished and that Ctrl+C must not be pressed again; until the run has ended a further Ctrl+C only repeats
+        that (_SigintGuard, in place since Phase 4 began: asyncio.run() would turn it into KeyboardInterrupt and cancel
+        every task, the shielded writes included). Plans not started yet stop, e-mails still waiting for their
+        template_swap turn are withdrawn (nothing has been written for them), and every started action finishes with
+        the revert or note that keeps its notice whole (_settle_interrupted). The tasks are cancelled before anything is
+        printed, the message is best effort (_print) and the wait comes in any case, so a console that fails cannot
+        skip it. A further cancellation of this task changes nothing."""
         for task in tasks:
             task.cancel()
-        while not all(task.done() for task in tasks):
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.wait(tasks)
+        try:
+            self._say_stopping()
+        finally:
+            while not all(task.done() for task in tasks):
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait(tasks)
 
-    def _stop_message(self) -> str:
+    def _say_stopping(self) -> None:
         """NEW-01: printed at the first Ctrl+C during apply, and again at every further Ctrl+C until the run ends."""
         busy = sum(1 for row in self.rows if row.started and row.plan.status == "PENDING")
         doing = f"finishing the changes already started for {busy} invoice(s)" if busy else "finishing up"
-        return f"Stopping (Ctrl+C): {doing}. Please wait - do not press Ctrl+C again."
+        self._print(f"\nStopping (Ctrl+C): {doing}. Please wait - do not press Ctrl+C again.")
 
     def _settle_held(self, *, interrupted: bool) -> None:
         """End of Phase 4 (review fix NEW-02). A row that the one-notice-per-booking replay sent to Ben or skipped,
@@ -1609,45 +1634,56 @@ async def _finish_shielded(fut: asyncio.Future[Any]) -> None:
 
 
 class _SigintGuard:
-    """Ctrl+C that only repeats a message while a stopped run finishes (review fix NEW-01; Windows and POSIX).
+    """Ctrl+C while Phase 4 changes things (review fixes NEW-01, R2-02; Windows and POSIX).
 
-    asyncio.run() answers the first Ctrl+C by cancelling the main task, and turns a second one into KeyboardInterrupt,
+    asyncio.run() answers the first Ctrl+C by cancelling the main task, and turns any later one into KeyboardInterrupt,
     after which it cancels every task — the shielded writes of Phase 4 step 3 included, which could leave a notice
-    half-recorded (RUL-01). Installed at the first Ctrl+C, this handler replaces asyncio.run()'s until restore(): it
-    only schedules `warn` on the event loop (printing inside a signal handler could re-enter a console write).
-    signal.signal() works the same on Windows and POSIX; outside the main thread it raises and nothing is installed
-    (Ctrl+C does not reach such a run). restore() puts the previous handler back, so asyncio.run() then restores the
-    default one as usual."""
+    half-recorded (RUL-01). This handler replaces asyncio.run()'s from the start of Phase 4, before any row task
+    exists, until the run has ended (restore()), so no Ctrl+C can reach asyncio.run() in between, however busy the
+    event loop is. The first Ctrl+C is passed on to the handler it replaced (asyncio.run()'s: the run is cancelled,
+    stops as Phase 4 step 3 says and ends with exit code 3) — unless the run is being cancelled already (a Ctrl+C that
+    reached asyncio.run() just before Phase 4, or any other cancellation). Every other one only schedules `warn` on the
+    event loop (printing inside a signal handler could re-enter a console write). Only signal.signal(), the previous
+    handler and call_soon_threadsafe() are used, which work the same on Windows and POSIX; outside the main thread
+    signal.signal() raises and nothing is installed (Ctrl+C does not reach such a run), nor when SIGINT is not handled
+    in Python (ignored, or the default action). restore() puts the previous handler back."""
 
-    def __init__(self, loop: asyncio.AbstractEventLoop, warn: Callable[[], None]) -> None:
+    def __init__(self, loop: asyncio.AbstractEventLoop, task: asyncio.Task[Any], warn: Callable[[], None]) -> None:
         self._loop = loop
+        self._task = task                               # the run's task: the one asyncio.run() cancels
         self._warn = warn
-        self._previous: Any = None
-        self._installed = False
+        self._previous: Callable[[int, FrameType | None], Any] | None = None
+        self._passed_on = False
 
     def install(self) -> None:
         try:
             previous = signal.getsignal(signal.SIGINT)
-            if previous is signal.SIG_IGN:              # Ctrl+C is ignored anyway
+            if not callable(previous):                  # SIG_IGN, SIG_DFL or not set from Python: leave it alone
                 return
+            # R3-02: known before the handler can run — a Ctrl+C that arrives while signal.signal() returns is then
+            # passed on like any first one, instead of only repeating the stop message of a run that goes on.
+            self._previous = previous
             signal.signal(signal.SIGINT, self._handle)
         except (ValueError, OSError, RuntimeError):     # not the main thread, or no signal support
-            return
-        self._previous = previous
-        self._installed = True
+            self._previous = None
 
     def _handle(self, signum: int, frame: FrameType | None) -> None:
+        previous = self._previous
+        if previous is not None and not self._passed_on and not self._task.cancelling():
+            self._passed_on = True
+            previous(signum, frame)     # asyncio.run(): cancel the run (another handler: whatever it does, as before)
+            return
         with contextlib.suppress(RuntimeError):         # the event loop is already closed
             self._loop.call_soon_threadsafe(self._warn)
 
     def restore(self) -> None:
-        if not self._installed:
+        previous = self._previous
+        if previous is None:
             return
-        self._installed = False
         with contextlib.suppress(ValueError, OSError, RuntimeError, TypeError):
             if signal.getsignal(signal.SIGINT) == self._handle:     # nobody replaced it meanwhile
-                previous = self._previous if self._previous is not None else signal.default_int_handler
                 signal.signal(signal.SIGINT, previous)
+        self._previous = None
 
 
 def _sentence(text: str) -> str:

@@ -10,6 +10,7 @@ never loaded) and passes --env-file wherever it needs settings.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import builtins
 import copy
@@ -22,9 +23,10 @@ import re
 import signal
 import subprocess
 import sys
+import textwrap
 import time
 from collections.abc import Callable, Iterator, Mapping
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -621,6 +623,120 @@ def test_ctrl_c_exits_3(monkeypatch: pytest.MonkeyPatch, write_env: Callable[...
     monkeypatch.setattr(pipeline, "run", interrupted)
     assert run_cli(["run", "x.csv", "--env-file", str(write_env())]) == 3
     assert "Interrupted (Ctrl+C)." in capsys.readouterr().err
+
+
+def test_two_quick_ctrl_c_presses_during_eta_run_finish_the_notice_and_exit_3(
+        world_csv: tuple[FakeWorld, Path], write_env: Callable[..., Path], capsys: pytest.CaptureFixture[str]) -> None:
+    """R2-02 through `eta run --yes` (asyncio.run()): two Ctrl+C presses while an e-mail is in flight, before the run
+    could begin to stop (no real signal is sent: the installed handler is called). The first stops the run, the second
+    only repeats the stop message; the e-mail still gets its VShip note and the program ends with exit code 3."""
+    world, csv_path = world_csv
+    pressed: list[bool] = []
+
+    async def hold(name: str, target: Any) -> None:
+        if name == "qbo.send_invoice" and not pressed:
+            pressed.append(True)
+            for _ in range(2):
+                signal.getsignal(signal.SIGINT)(signal.SIGINT, None)   # type: ignore[operator]
+            for _ in range(10):
+                await asyncio.sleep(0)            # the e-mail is still in flight
+
+    world.qbo.before_write = hold
+    assert run_cli(["run", str(csv_path), "--yes", "--env-file", str(write_env())]) == 3
+    subject = "Invoice for Booking no. EBKG10000001. ****ARRIVED ON 11/03. PLEASE PLEASE PAY AND CLEAR THE CARGO****"
+    assert world.calls.writes("1001", "70001") == [
+        ("qbo.update_invoice", "EBKG10000001", date(2026, 11, 3), "EBKG10000001 A"),
+        ("qbo.send_invoice", "EBKG10000001 A", subject),
+        ("vship.post_comment", "70001", "ARRIVED ON 11/03. NOTIF #1")]
+    captured = capsys.readouterr()
+    assert captured.out.count("Please wait - do not press Ctrl+C again.") == 2
+    assert "Interrupted (Ctrl+C)." in captured.err
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+
+
+class GoneConsole(io.StringIO):
+    """A console stream whose reader has gone (`eta run … 2>&1 | tee run.log` after Ctrl+C): every write raises."""
+
+    def write(self, text: str) -> int:
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+def test_ctrl_c_exits_3_when_the_console_is_gone(monkeypatch: pytest.MonkeyPatch,
+                                                write_env: Callable[..., Path]) -> None:
+    """R2-01: the `Interrupted (Ctrl+C).` line is best effort, so a console that is gone does not turn the end of a
+    stopped run into a traceback (exit code 1)."""
+    async def interrupted(*args: Any, **kwargs: Any) -> RunSummary:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pipeline, "run", interrupted)
+    monkeypatch.setattr(sys, "stderr", GoneConsole())
+    assert run_cli(["run", "x.csv", "--env-file", str(write_env())]) == 3
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="replaces the process's stdout with a POSIX pipe")
+@pytest.mark.parametrize("unbuffered", [False, True], ids=["buffered", "PYTHONUNBUFFERED"])
+@pytest.mark.parametrize("method", ["qbo.update_invoice", "qbo.send_invoice"])
+def test_ctrl_c_with_eta_run_piped_into_tee_still_finishes_the_notice_and_exits_3(
+        write_env: Callable[..., Path], tmp_path: Path, method: str, unbuffered: bool) -> None:
+    """R2-01 end to end: `eta run x.csv --yes | tee run.log` and one Ctrl+C. The terminal sends it to tee as well, so
+    from then on stdout is a pipe without a reader. A real process runs `eta run` through cli.main() (asyncio.run(), the
+    real sys.stdout) on the fakes; while the QBO update or the e-mail is in flight, fd 1 becomes such a pipe and the
+    installed SIGINT handler is called (no real signal is sent). The write in flight still gets its revert or VShip
+    note, the report is rewritten and the process ends with exit code 3. Before the fix the stop message raised
+    BrokenPipeError out of the drain: the in-flight write was cancelled, the report kept its plan and the exit code was
+    1. R3-01: with buffered output (no PYTHONUNBUFFERED, the usual console) the stop message that the pipe did not take
+    stays buffered; the interpreter's last flush at exit used to fail on it and turn exit code 3 into 120."""
+    code = textwrap.dedent(f"""
+        import asyncio, json, os, signal, sys
+        from datetime import datetime
+        sys.path.insert(0, {str(Path(__file__).parent)!r})
+        from fakes import FakeWorld, fake_build_services
+        from eta_automations import cli, pipeline
+        from eta_automations.clock import FixedClock
+
+        clock = FixedClock(datetime(2026, 11, 5, 9, 30))
+        world = FakeWorld(clock)
+        booking = world.add("EBKG10000001", "2450.00", eta=datetime(2026, 11, 3))
+        with open("input.csv", "w", encoding="utf-8") as fh:
+            fh.write(booking.line + "\\n")
+
+        async def ctrl_c_with_tee(name, target):
+            if name == {method!r}:
+                read_end, write_end = os.pipe()
+                os.close(read_end)                         # tee ends with the Ctrl+C ...
+                os.dup2(write_end, sys.stdout.fileno())
+                os.close(write_end)
+                signal.getsignal(signal.SIGINT)(signal.SIGINT, None)     # ... that asyncio.run() gets
+                for _ in range(50):
+                    await asyncio.sleep(0)                 # the write is still in flight while the run stops
+
+        world.qbo.before_write = ctrl_c_with_tee
+        pipeline.build_services = fake_build_services(world)
+        pipeline.SystemClock = lambda: clock
+        code = cli.main(["run", "input.csv", "--yes", "--env-file", {str(write_env())!r}])
+        with open("writes.json", "w", encoding="utf-8") as fh:
+            json.dump([[str(part) for part in call] for call in world.writes()], fh)
+        sys.exit(code)
+    """)
+    env = {name: value for name, value in os.environ.items() if name != "PYTHONUNBUFFERED"}
+    if unbuffered:
+        env["PYTHONUNBUFFERED"] = "1"
+    done = subprocess.run([sys.executable, "-c", code], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                          cwd=tmp_path, env=env, timeout=120, check=False)
+    assert done.returncode == 3, done.stderr
+    assert "Exception ignored" not in done.stderr, done.stderr
+    writes = json.loads((tmp_path / "writes.json").read_text(encoding="utf-8"))
+    suffix = ["qbo.update_invoice", "EBKG10000001", "2026-11-03", "EBKG10000001 A"]
+    if method == "qbo.update_invoice":
+        assert writes == [suffix, ["qbo.update_invoice", "EBKG10000001 A", "None", "EBKG10000001"]]
+    else:
+        subject = ("Invoice for Booking no. EBKG10000001. ****ARRIVED ON 11/03. PLEASE PLEASE PAY AND CLEAR THE "
+                   "CARGO****")
+        assert writes == [suffix, ["qbo.send_invoice", "EBKG10000001 A", subject],
+                          ["vship.post_comment", "70001", "ARRIVED ON 11/03. NOTIF #1"]]   # the note, no ETA patch
+    report = json.loads((tmp_path / "output" / "reports" / "run_20261105_093000.json").read_text(encoding="utf-8"))
+    assert (report["report_stage"], [r["status"] for r in report["rows"]]) == ("interrupted", ["INTERRUPTED"])
+    assert "Console output failed (BrokenPipeError" in done.stderr and "Interrupted (Ctrl+C)." in done.stderr
 
 
 def test_prompt_restores_the_sigint_handler(console: Callable[..., Console]) -> None:

@@ -978,9 +978,10 @@ class QboClient:
         """ADDITION (review fix XCT-03) — the 04b §6.2 step 1 crash recovery on its own, whatever QB_EMAIL_STRATEGY is
         (as `eta probe qbo --restore-template`): restore the invoice e-mail subject a crashed template_swap run left in
         `<state_dir>/qbo_email_template_recovery.json` and delete the file. True when a recovery file was handled,
-        False when there was nothing to do. Raises TemplateRestoreError (with the manual instructions) or
-        EmailPathUnavailableError (another company's file); RuntimeError on a read-only client. An error about the file
-        itself (another company's, unreadable, no original subject) has `recovery_file_unusable` set (NEW-03)."""
+        False when there was nothing to do. Raises TemplateRestoreError (with the manual instructions: also for a file
+        that cannot be read, is damaged, or is this company's without an original subject, R2-03) or
+        EmailPathUnavailableError (another company's file: `recovery_file_unusable` set, NEW-03); RuntimeError on a
+        read-only client."""
         self._ensure_writable()
         emailer = self._template_recovery()
         return False if emailer is None else await emailer.recover()
@@ -1017,8 +1018,8 @@ class QboClient:
             await self.recover_email_template()
         except Exception as exc:  # noqa: BLE001 - cleanup must not raise; the instructions are logged
             if getattr(exc, "recovery_file_unusable", False):
-                # NEW-03: another company's file, or an unreadable one — not a sign that this company's template is
-                # broken; a template_swap run stops its e-mails for it in its preflight.
+                # NEW-03 / R2-03: another company's file — not a sign that this company's template is broken; a
+                # template_swap run stops its e-mails for it in its preflight. A damaged file is an ERROR (below).
                 log.warning("The QuickBooks e-mail template recovery file was left as it is at shutdown: %s", exc)
             else:
                 log.error("The QuickBooks invoice e-mail subject could not be restored at shutdown: %s", exc)

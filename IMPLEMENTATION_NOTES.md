@@ -21,6 +21,8 @@ Test status at the end of the build (Python 3.13.18):
 `python -m pytest -q` → **1553 passed, 8 skipped**. The skips are the 7 opt-in live smoke tests (12 §5,
 `ETA_LIVE_TESTS=1`) and one MSC test that needs a German locale. The tests never touch the network.
 After the review fixes of area A (section B): **1622 passed, 8 skipped**, also with `-W error::RuntimeWarning`.
+After all review fixes (section B): **1738 passed, 8 skipped** on Python 3.13.18 (also with
+`-W error::RuntimeWarning`, and without `PYTHONUNBUFFERED`) and on Python 3.12.3.
 
 Precedence used for conflicts (from `BUILD_PROMPT.md`): 03-foundations > 01-business-rules > 04–09 (their test
 tables are acceptance tests) > 10-pipeline > the rest. Where a genuine contradiction remained, the safer behaviour
@@ -218,12 +220,19 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
   empty template subject at preflight raises `EmailPathUnavailableError`; an unreadable recovery file raises
   `TemplateRestoreError`; failing to write the recovery file raises `EmailPathUnavailableError`. A cancellation
   during the swap write or the send still triggers the restore.
-- **Unusable recovery file** (review fix NEW-03): the errors about the recovery file itself — another company's
-  realm (the exact 04b §6.2 step 1 text), unreadable, not JSON, not an object, no original subject — carry
-  `recovery_file_unusable=True` (a class attribute added to `EmailPathUnavailableError`, default False; their
-  classes and texts are unchanged). The template_swap preflight still fails with them; the pipeline's repair for
-  runs without template_swap e-mails and `QboClient.aclose()` only warn about them (see `pipeline.py`). A failed
-  restore of this company's template is not marked.
+- **Another company's recovery file** (review fixes NEW-03, R2-03): only the error about a readable recovery file
+  whose `realm_id` names another company (the exact 04b §6.2 step 1 text) carries `recovery_file_unusable=True` (a
+  class attribute added to `EmailPathUnavailableError`, default False). The template_swap preflight still fails with
+  it; the pipeline's repair for runs without template_swap e-mails and `QboClient.aclose()` only warn about it (see
+  `pipeline.py`). Every other problem is this company's to fix and raises an unmarked `TemplateRestoreError` that
+  says what to do (check the invoice e-mail subject in QuickBooks, then delete the file): a file that cannot be read
+  (`cannot be read (<error>)`), is not JSON or not an object, one whose record names no company (no or empty
+  `realm_id`; our own file always has one, so this is damage, not another company's file — 04b only names a
+  *different* realm), and this company's record without an original subject (its message now says where in
+  QuickBooks to look). Round 2 had marked these too, so such a run only logged a WARNING and exited 0 although this
+  company's subject might still name another customer's booking. A failed restore of this company's template is
+  not marked either. `TemplateSwapEmailer.aclose()` uses the same check and logs the error, so a file that names
+  no company is no longer called another company's.
 - Send failures are classified: a failure at the token endpoint, a 400/401/403/404/429/503 or a connect error
   means "not sent, safe to retry"; timeouts, 500/502/504 and unreadable answers mean "outcome unknown" and set
   `outcome_unknown=True` on the raised `InvoiceSendError` (also for Graph/SMTP, and for a `TemplateRestoreError`
@@ -463,11 +472,15 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
   `QboClient.recover_email_template()` (an addition: the `--restore-template` recovery) before the prompt when the
   recovery file exists; a dry run only warns. A failed restore prints the manual instructions (before the prompt and
   in the final summary) and the run exits 4. `QboClient.aclose()` does the same recovery as a fallback (10 §3).
-  **A recovery file this company cannot use** (review fix NEW-03) — one of another QuickBooks company, e.g. left by
-  a sandbox run before `QB_SANDBOX` was switched off, or one that cannot be read — says nothing about this
-  company's template. Such a run (it e-mails nothing through template_swap) logs a WARNING naming the file and the
-  reason, leaves the file alone and keeps exit code 0; `QboClient.aclose()` also only warns. A run that e-mails
-  through template_swap keeps the hard failure of its preflight (04b §6.2 step 1: no e-mail, exit 4).
+  **A recovery file of another QuickBooks company** (review fixes NEW-03, R2-03), e.g. left by a sandbox run before
+  `QB_SANDBOX` was switched off, says nothing about this company's template. Such a run (it e-mails nothing through
+  template_swap) logs a WARNING naming the file and the reason, leaves the file alone and keeps exit code 0;
+  `QboClient.aclose()` also only warns. A run that e-mails through template_swap keeps the hard failure of its
+  preflight (04b §6.2 step 1: no e-mail, exit 4). **A damaged recovery file, or this company's without an original
+  subject** (review fix R2-03), means this company's template_swap run may have crashed between swap and restore,
+  so its subject may still be wrong and cannot be restored automatically: every real run prints it with the banner
+  and the manual instructions, repeats it in the summary and exits 4, as before NEW-03. The dry-run warning says
+  that a real run restores the subject before its prompt, "or says why it cannot".
 - A NOTIFY row already running when the e-mail path breaks does not send; it gets the stored error and its
   DocNumber is reverted (D11). NOTIFY rows not yet started fail without any action.
 - An unresolved VShip booking id fails the VShip steps with `Note Write Error, QB Invoice Processing Successful`
@@ -475,12 +488,29 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
 - A partially paid invoice whose internal comments are unavailable fails the TR/SWB check with
   `QB Invoice Processing Error, No Email Sent` (01 §6.7).
 - **Ctrl+C during apply:** it prints at once `Stopping (Ctrl+C): finishing the changes already started for <n>
-  invoice(s). Please wait - do not press Ctrl+C again.` (review fix NEW-01), plans not started yet stop, and each
-  running plan finishes its current (shielded) action, then stops; unfinished plans become INTERRUPTED, the summary
-  is printed, the report is rewritten with stage `interrupted`, the clients are closed and the lock released, then
-  the cancellation propagates (the CLI exits 3). During planning or review it prints `Interrupted before anything was
-  changed.`. The row tasks run under `asyncio.wait` instead of a TaskGroup so that the first cancellation is seen at
-  once (a TaskGroup only re-raises it after every child has finished).
+  invoice(s). Please wait - do not press Ctrl+C again.` (review fix NEW-01; `finishing up` instead when no plan is
+  running), plans not started yet stop, and each running plan finishes its current (shielded) action, then stops;
+  unfinished plans become INTERRUPTED, the summary is printed, the report is rewritten with stage `interrupted`, the
+  clients are closed and the lock released, then the cancellation propagates (the CLI exits 3). During planning or
+  review it prints `Interrupted before anything was changed.`. The row tasks run under `asyncio.wait` instead of a
+  TaskGroup so that the first cancellation is seen at once (a TaskGroup only re-raises it after every child has
+  finished).
+- **The console is best effort once changes are applied** (review fix R2-01). With `eta run … | tee run.log` (or
+  `| more`, PowerShell `| Tee-Object`) the terminal sends the Ctrl+C to the reader too, so stdout becomes a pipe
+  without a reader. The drain used to print the stop message before it cancelled and awaited the row tasks; the
+  BrokenPipeError skipped both, and asyncio.run() then cancelled the shielded writes: a lone suffix or an e-mail
+  without its note, the report left at the plan, exit code 1. Now the drain cancels the tasks first and waits for
+  them in a `finally`, and from the start of Phase 4 (and on the Ctrl+C path of Phases 2–3) `_print` swallows
+  `OSError`/`ValueError` from the stream (closed pipe, full disk, closed file) and logs the first such failure once
+  as a WARNING (`Console output failed (…); the run goes on without it`). So neither the stop message, its repeats,
+  the `Interrupted: …` line, the summary of `_finish()` nor the e-mail-path banner of a row (which could otherwise
+  cost an e-mailed row its note) can stop the apply, the drain or the final report; every console line is still in
+  the log file (DEBUG). Before Phase 4 a failing console still stops the run, while nothing has been changed. The
+  CLI's `Interrupted (Ctrl+C).` line is best effort as well, so the exit code stays 3 (`2>&1 | tee`). The text a
+  failed write could not deliver stays in Python's buffer of a block-buffered stdout (the usual case: no
+  `PYTHONUNBUFFERED`), and the interpreter's own flush at exit used to fail on it again and replace exit code 3 with
+  120 (review fix R3-01). Before `main()` returns, the CLI now flushes stdout and stderr itself and points a process
+  stream whose flush fails at the null device, so that last flush has nothing left to fail on.
 - **A single Ctrl+C does not split a notice** (review fix RUL-01; 01 §1 records a notice twice, as the `A` suffix
   and the VShip NOTIF note). A NOTIFY plan interrupted after its suffixing QBO update and before the e-mail gets the
   D11 revert (report: `… ; DocNumber reverted to X`), so the next run sees the invoice under its old number; one
@@ -488,13 +518,22 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
   day. Both steps are shielded like the current action. A failing revert writes `QB Invoice Processing Error, No
   Email Sent` (`interrupted (Ctrl+C) before the e-mail was sent (could not revert …)`), a failing note its `Note
   Write Error` entry; such rows are FAILED instead of INTERRUPTED.
-- **Further Ctrl+C presses only repeat the stop message** (review fix NEW-01). asyncio.run() turns a second
-  Ctrl+C into KeyboardInterrupt and then cancels every task, the shielded revert/note steps included. From the
-  first Ctrl+C during apply until `run()` ends (report rewritten, clients closed, lock released), a SIGINT handler
-  installed with `signal.signal` (Windows and POSIX; nothing is installed off the main thread) only schedules the
-  stop message on the event loop, and the previous handler (asyncio.run()'s) is put back afterwards, so the CLI
-  still ends with exit code 3. Closing the console window or killing the process is not covered: that can still
-  split a notice.
+- **Further Ctrl+C presses only repeat the stop message** (review fixes NEW-01, R2-02). asyncio.run() turns a second
+  Ctrl+C into KeyboardInterrupt and then cancels every task, the shielded revert/note steps included. From the start
+  of Phase 4 — before step 1 and before any row task exists — until `run()` ends (report rewritten, clients closed,
+  lock released), a SIGINT handler installed with `signal.signal` (`_SigintGuard`) replaces asyncio.run()'s. It
+  passes the first Ctrl+C on to the handler it replaced (asyncio.run()'s, which cancels the run: step 3 as above,
+  KeyboardInterrupt from asyncio.run() at the end, exit code 3), and every later one only schedules the stop message
+  on the event loop; a run that is already being cancelled (a Ctrl+C that reached asyncio.run() just before Phase 4)
+  gets only the message for every press. The handler it replaced is recorded before the new one is put in place
+  (review fix R3-02), so a Ctrl+C that arrives while `signal.signal()` returns is passed on as the first one instead
+  of only printing the stop message of a run that goes on. Round 2 installed the handler only when the drain began,
+  so a second Ctrl+C that came before (the event loop busy with a slow fsync, or two presses in quick succession)
+  still reached asyncio.run() and could split a notice. The previous handler is put back on every exit path
+  (`execute()`'s `finally`). Nothing is installed off the main thread (`signal.signal` refuses; Ctrl+C does not
+  reach such a run) or when SIGINT is ignored or not handled by Python. Only `signal.signal`, the previous handler
+  and `loop.call_soon_threadsafe` are used, which work the same on Windows. Closing the console window, Ctrl+Break
+  (Windows) or killing the process is not covered: that ends the process at once and can still split a notice.
 - **E-mails waiting for their template_swap turn are withdrawn at Ctrl+C** (review fix NEW-01, the optional part
   of RUL-01; a deviation from the letter of 10 Phase 4 step 3, whose "current action" they are). template_swap
   sends one e-mail at a time (04b §6.2 step 3); the pipeline now keeps that queue itself (`_send_turn`, one
@@ -545,7 +584,8 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
 
 ### `cli.py` (11)
 
-- **Exit codes:** Ctrl+C exits 3 (`Interrupted (Ctrl+C).`), since 11 §3 defines no code for it. A cancelled
+- **Exit codes:** Ctrl+C exits 3 (`Interrupted (Ctrl+C).`, printed best effort: review fix R2-01), since 11 §3
+  defines no code for it. A cancelled
   file picker prints `No input file selected - nothing was changed.` and exits 3; no Tk exits 2.
 - **Probe exit codes:** 0 working; 1 not working (probe `error` set, service or lookup errors; a `--compare`
   DIFF, as in 06 §10); 2 configuration, authentication or run-lock error, including "service not configured";
@@ -663,14 +703,37 @@ the fix; the reasons are in section A under `pipeline.py` and `qbo/email.py`.
 
 | Finding | Change | Files |
 |---|---|---|
-| NEW-01 | Ctrl+C during apply says at once that the started changes are finished and that Ctrl+C must not be pressed again; further Ctrl+C presses only repeat that (temporary SIGINT handler) instead of cancelling the revert/note steps; e-mails still waiting for their template_swap turn are withdrawn (suffix reverted) | `pipeline.py`, `README.md` |
+| NEW-01 | Ctrl+C during apply says at once that the started changes are finished and that Ctrl+C must not be pressed again; further Ctrl+C presses only repeat that (temporary SIGINT handler; in place from the start of Phase 4 since R2-02) instead of cancelling the revert/note steps; e-mails still waiting for their template_swap turn are withdrawn (suffix reverted) | `pipeline.py`, `README.md` |
 | NEW-02 | A row sent to Ben or skipped because an earlier row of its booking gives the notice is written only once that notice went out; otherwise it is reported as not processed (never e-mailed in its place). The replay runs after the e-mail preflight | `pipeline.py`, `texts.py`, `README.md` |
-| NEW-03 | A recovery file of another QuickBooks company, or an unreadable one, only warns (exit 0) in runs that e-mail nothing through template_swap; template_swap runs with e-mails keep the hard failure | `errors.py`, `qbo/email.py`, `qbo/client.py`, `pipeline.py`, `README.md` |
+| NEW-03 | A recovery file of another QuickBooks company, or an unreadable one, only warns (exit 0) in runs that e-mail nothing through template_swap; template_swap runs with e-mails keep the hard failure (narrowed to another company's file by R2-03) | `errors.py`, `qbo/email.py`, `qbo/client.py`, `pipeline.py`, `README.md` |
 
 The tests are in `tests/test_pipeline.py` (the deterministic Ctrl+C tests emulate asyncio.run()'s SIGINT handler and
 call the installed handler as the second Ctrl+C; no real signal is sent), `tests/test_qbo_client.py` and
 `tests/test_docs.py`. `test_interruption_with_parallel_sends_writes_the_note_of_every_e_mailed_row` now runs with
 `graph` (`…_parallel_graph_sends_…`): with template_swap the queued sends are withdrawn instead.
+
+**Review fixes, round 3** (problems found in the round-2 fixes). Each fix has a regression test that failed before
+the fix; the reasons are in section A under `pipeline.py` and `qbo/email.py`.
+
+| Finding | Change | Files |
+|---|---|---|
+| R2-01 | A console that fails at Ctrl+C (stdout piped into `tee`/`more`, whose reader ends with the same Ctrl+C) no longer skips the drain: the row tasks are cancelled and awaited before anything is printed, and from Phase 4 on every console line is best effort, so started changes still get their revert or note, the report is rewritten and the exit code stays 3 | `pipeline.py`, `cli.py`, `README.md` |
+| R2-02 | The Ctrl+C handler is in place from the start of Phase 4, before any row task exists: the first Ctrl+C is passed on to asyncio.run() (stops the run, exit code 3), every other one only repeats the stop message, also when it comes before the stop has begun | `pipeline.py`, `README.md` |
+| R2-03 | Only a readable recovery file of another QuickBooks company still just warns (exit 0) in runs without template_swap e-mails; a damaged one (unreadable, not JSON, names no company) and this company's without an original subject are reported with the banner and the manual instructions, exit 4. The dry-run warning no longer promises a restore | `errors.py`, `qbo/email.py`, `qbo/client.py`, `pipeline.py`, `README.md` |
+
+The Ctrl+C tests drive the drain with fake services, an injected console that raises (BrokenPipeError, OSError,
+ValueError) and simulated presses: the installed SIGINT handler is called directly, under the real asyncio.run()
+(`tests/test_pipeline.py`) and through `eta run` (`tests/test_cli.py`, one of them in a child process whose stdout
+becomes a pipe without a reader); no real signal is sent and nothing sleeps. The recovery-file tests use the real
+`QboClient` (`tests/test_pipeline.py`, `tests/test_qbo_client.py`).
+
+**Final fixes** (two low-severity problems found by the round-3 recheck; it confirmed R2-02 and R2-03 and found
+R2-01 correct apart from R3-01). Each has a regression test that failed before the fix.
+
+| Finding | Change | Files |
+|---|---|---|
+| R3-01 | `eta run … \| tee run.log` stopped with Ctrl+C ended with exit code 120 instead of 3 when stdout was block-buffered (no `PYTHONUNBUFFERED`): the stop message the pipe did not take stayed buffered and the interpreter's flush at exit failed on it. `main()` now flushes stdout and stderr before it returns and points a process stream that fails at the null device. The child-process test runs with and without `PYTHONUNBUFFERED` (the round-3 version passed only because the build container sets it) | `cli.py` |
+| R3-02 | `_SigintGuard.install()` recorded the handler it replaced only after installing its own, so a Ctrl+C in between only printed the stop message and the run went on (exit code 0). The replaced handler is now recorded first (and forgotten again if `signal.signal()` fails) | `pipeline.py` |
 
 ---
 
@@ -685,18 +748,17 @@ call the installed handler as the second Ctrl+C; no real signal is sent), `tests
    Windows console, an injected input function — `input_fn` runs in a daemon thread. One Ctrl+C now exits with
    code 3 (tested on Linux through a pseudo-terminal). On Windows the console path is not verified; the
    double-click pause reuses a reader left waiting by Ctrl+C, so one Enter closes the window. The same holds for
-   Ctrl+C during apply (review fix NEW-01): the temporary SIGINT handler uses only `signal.signal` and
-   `loop.call_soon_threadsafe`, which Windows supports, and was tested on Linux with real signals through `eta run`
-   (fake services, three SIGINTs: the stop message each time, the note or revert written, exit code 3), but not
-   on a Windows console (section D).
-2. **Python 3.12 is only partly verified.** All source and test files parse under Python 3.12.3, but no 3.12
-   virtual environment could be created in the build container. Running the suite with 3.12 against the 3.13
-   environment's packages gave 1444 passed and 109 failed; every failure inspected was numpy's 3.13 binary
-   extension failing to load (pandas paths), and without the pandas-dependent test modules 1155 passed and 0
-   failed. 12 §6 asks for a full pass on 3.12 and 3.13: run the suite once in a real 3.12 environment
-   (section D).
-3. `pip install -e ".[dev]"` was not re-run at the end of the build (no package installs were allowed); the
-   existing editable install, including the `eta` command, works.
+   Ctrl+C during apply (review fixes NEW-01, R2-02): the temporary SIGINT handler uses only `signal.signal`, the
+   handler it replaced and `loop.call_soon_threadsafe`, which Windows supports, and was tested on Linux with real
+   signals through `eta run` (fake services: up to three SIGINTs, also two at once, during a slow fsync and with
+   stdout piped into a reader that ends at the first one; the note or revert written, the report rewritten, exit
+   code 3), but not on a Windows console (section D).
+2. **Python 3.12 (resolved during the review).** During the build the suite could only be run with 3.12 against
+   the 3.13 environment's packages, where numpy's 3.13 binary extension failed to load (109 failures, all on
+   pandas paths). The review then created a real Python 3.12.3 virtual environment: the full suite passes there
+   with the same result as on 3.13 (see the test status at the top). Windows has not been tried (section D).
+3. **`pip install -e ".[dev]"` (resolved during the review)** ran cleanly into that fresh 3.12 environment, and its
+   `eta` command works (`eta --version` → `eta 1.0.0`).
 4. **Nothing has been run against a real service yet.** Every probe and the opt-in live smoke tests
    (`tests/test_live_smoke.py`) are still to be run with real credentials (section D).
 5. **Windows-only paths are tested with fakes only:** the `msvcrt` branch of the run lock, the default
@@ -858,8 +920,9 @@ under `<ETA_STATE_DIR>/probe/`; the item says what to look for in it.
   `Stopping (Ctrl+C): finishing the changes already started …` at once; press it again → the line is repeated and
   the run goes on to its summary and exit code 3. In QuickBooks and VShip every row is whole: an invoice with the
   new `A` suffix has its e-mail and its `NOTIF` note, the others have their old DocNumber.
-- [ ] **Python 3.12.** `py -3.12 -m venv .venv312`, `.venv312\Scripts\pip install -e ".[dev]"`,
-  `.venv312\Scripts\python -m pytest -q` → all tests pass (only `live` tests and the German-locale test skipped).
+- [ ] **Python 3.12 on Windows** (passed on Linux in the build container). `py -3.12 -m venv .venv312`,
+  `.venv312\Scripts\pip install -e ".[dev]"`, `.venv312\Scripts\python -m pytest -q` → all tests pass (only
+  `live` tests and the German-locale test skipped).
 - [ ] **Optional live smoke tests** (read-only probes; no writes, no e-mail). On Windows, set each variable
   with `set NAME=value` first. Add `ETA_LIVE_CMA_BOOKING=<NAM…>` only if the billable CMA probe should run.
 

@@ -54,3 +54,27 @@ def test_ctrl_c_safety_note_is_about_one_ctrl_c_and_says_what_a_second_one_does(
     assert "closing the window" in note.lower() and "half-recorded" in note
     notes = (REPO_ROOT / "IMPLEMENTATION_NOTES.md").read_text(encoding="utf-8")
     assert "Ctrl+C never splits a notice" not in notes
+
+
+def test_ctrl_c_docs_cover_quick_presses_piped_output_and_both_stop_messages() -> None:
+    """R2-01 / R2-02: the safety note says what piped output does (the run still finishes, exit code 3) and that a
+    further Ctrl+C only repeats the message however quickly it comes; the troubleshooting row lists both forms of the
+    stop message. IMPLEMENTATION_NOTES no longer says the handler only comes with the first Ctrl+C."""
+    safety = README.split("## Safety notes", 1)[1].split("\n## ", 1)[0]
+    note = " ".join(next(item for item in safety.split("\n- ") if "Ctrl+C" in item).split())
+    assert "| tee run.log" in note and "the run still finishes as described and ends with exit code 3" in note
+    assert "however quickly" in note and "log file" in note
+    row = next(line for line in README.splitlines() if line.startswith("| `Stopping (Ctrl+C):"))
+    assert "finishing the changes already started for <n> invoice(s)." in row and "finishing up." in row
+    notes = " ".join((REPO_ROOT / "IMPLEMENTATION_NOTES.md").read_text(encoding="utf-8").split())
+    assert "first Ctrl+C during apply until" not in notes
+
+
+def test_recovery_file_docs_tell_another_company_s_file_from_a_damaged_one() -> None:
+    """R2-03: only another company's recovery file is harmless for runs without template_swap e-mails (exit code 0); a
+    damaged file or this company's without an original subject is reported with what to do (exit code 4)."""
+    rows = [line for line in README.splitlines() if "recovery file" in line and line.startswith("| `")]
+    other = next(line for line in rows if line.startswith("| `recovery file belongs to another QuickBooks company"))
+    damaged = next(line for line in rows if "names no QuickBooks company" in line)
+    assert "exit code 0" in other and "cannot be read" not in other and "no original subject" not in other
+    assert "exit code 4" in damaged and "has no original subject" in damaged and "then delete the file" in damaged

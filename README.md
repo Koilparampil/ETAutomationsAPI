@@ -18,8 +18,7 @@ Contents: [Requirements](#requirements) · [Install](#install) · [Configuration
 
 ## Requirements
 
-- **Python 3.12 or newer** (developed and fully tested on Python 3.13; see `IMPLEMENTATION_NOTES.md` for the
-  3.12 status). Windows, macOS or Linux.
+- **Python 3.12 or newer** (the full test suite passes on Python 3.12 and 3.13). Windows, macOS or Linux.
 - **No browser.** No Playwright, Chromium or Chrome is installed or driven; nothing tries to get around bot
   protection. Dependencies: `httpx`, `python-dotenv`, `pandas`, `tzdata` (installed by `pip`).
 - HTTPS access to QuickBooks Online, VShipCRM and the carrier APIs. A proxy is used when the standard
@@ -533,13 +532,14 @@ the run report.
 | `[SKIP] #<doc> - already e-mailed today at <HH:MM> (ledger); use --force to resend` | The ledger in `ETA_STATE_DIR` shows that this invoice's e-mail already went out today (for example in an earlier run that was interrupted), or that a send today ended with "outcome unknown" and may have gone out. Check the customer's e-mail or QuickBooks before you consider `--force`; it would send the e-mail again |
 | `The template_swap e-mail method has not been verified for this company…` | Run the e-mail verification (`eta probe qbo --send-test --invoice <test invoice>`). Until then e-mail rows fail with `QB Invoice Processing Error, No Email Sent` and the run exits with code 4 |
 | A run was killed while sending | The next real run (not a dry run) restores the QuickBooks e-mail template subject before its prompt, whatever `QB_EMAIL_STRATEGY` is and also with `--no-email` or nothing to e-mail; `eta probe qbo --restore-template` does only that. A dry run only warns |
-| `recovery file belongs to another QuickBooks company: …` / `The e-mail template recovery file … cannot be read` (or `is not valid JSON`, `has an unexpected format`, `has no original subject`) | `qbo_email_template_recovery.json` in `ETA_STATE_DIR` was left by a run on another company (e.g. the sandbox before switching `QB_SANDBOX` off), or is damaged. A run that e-mails nothing through `template_swap` (`graph`/`smtp`, `--no-email`, nothing to e-mail) only logs this as a WARNING and ends normally (exit code 0); a `template_swap` run with e-mails sends none of them (exit code 4). Restore the other company's subject with `eta probe qbo --restore-template` and that company's settings, or check the invoice e-mail subject in QuickBooks (Settings → Account and settings → Sales → Messages); then delete the file |
+| `recovery file belongs to another QuickBooks company: …` | `qbo_email_template_recovery.json` in `ETA_STATE_DIR` was left by a crashed `template_swap` run on another company (e.g. the sandbox before switching `QB_SANDBOX` off); it says nothing about this company's template. A run that e-mails nothing through `template_swap` (`graph`/`smtp`, `--no-email`, nothing to e-mail) only logs this as a WARNING and ends normally (exit code 0); a `template_swap` run with e-mails sends none of them (exit code 4). Restore that company's subject with `eta probe qbo --restore-template` and that company's settings, then delete the file if it is still there |
+| `The e-mail template recovery file … cannot be read` (or `is not valid JSON`, `has an unexpected format`, `names no QuickBooks company`) / `The recovery file … has no original subject` (exit code 4) | The recovery file is damaged, or is this company's but does not say which subject to put back. A `template_swap` run of this company may have crashed between changing and restoring the invoice e-mail subject, so the subject may still name another customer's booking. Every real run reports this prominently (with `template_swap` e-mails, none of them is sent) and ends with exit code 4; its other changes are still made. Check the invoice e-mail subject in QuickBooks (Settings → Account and settings → Sales → Messages), set it back if needed, then delete the file |
 | `The QuickBooks invoice e-mail template must be restored by hand: …` (exit code 4) | Restoring the company-wide invoice e-mail subject failed after a send. Set the subject back as the message says (or run `eta probe qbo --restore-template` once QuickBooks answers again). The invoice being e-mailed at that moment did get its e-mail and its VShip note; the run's other e-mail rows failed with `QB Invoice Processing Error, No Email Sent` and are e-mailed by the next run |
 | `Another ETAutomationsAPI run is in progress (lock: …)` | Wait for the other run. The lock is released by the operating system when that process ends, so a leftover `run.lock` file is harmless |
 | `Missing required settings: …` / `<NAME> must be …` / `Settings file not found: …` / `Cannot read the settings file …: save it as UTF-8 text` | Fix `.env` (or the `--env-file` path) as the message says; save it as UTF-8 |
 | `No input file given and no GUI available — pass the CSV path: eta run <file.csv>` | Tkinter is not available: pass the file on the command line |
 | Ctrl+C at the `[y/N]` prompt or at the `eta qbo-auth` paste prompt | One Ctrl+C ends the program (exit code 3); nothing has been changed at that point. On a Windows console this is not verified yet: if the window does not close, press Enter |
-| `Stopping (Ctrl+C): finishing the changes already started for <n> invoice(s). Please wait - do not press Ctrl+C again.` | Ctrl+C while changes were being applied. Wait: the program finishes what it started (see [Safety notes](#safety-notes)), prints the summary and ends with exit code 3. Further Ctrl+C presses only repeat this line; run the file again afterwards |
+| `Stopping (Ctrl+C): finishing the changes already started for <n> invoice(s). Please wait - do not press Ctrl+C again.` (or `Stopping (Ctrl+C): finishing up. Please wait - do not press Ctrl+C again.` when no change is running) | Ctrl+C while changes were being applied. Wait: the program finishes what it started (see [Safety notes](#safety-notes)), prints the summary and ends with exit code 3. Further Ctrl+C presses only repeat this line, however quickly they follow the first; run the file again afterwards |
 
 ## Safety notes
 
@@ -553,10 +553,17 @@ the run report.
   (`template_swap` sends one at a time) is not sent. A notice is recorded twice, as the `A` suffix and the VShip
   `NOTIF` note, and the run does not stop between the two: an invoice whose suffix is set but whose e-mail was not
   sent gets its old number back, and an e-mailed invoice still gets its note (a failure there is written to
-  `Failed_To_Process.txt`). Pressing Ctrl+C again only repeats the message, so wait for the program to end.
-  Closing the window or killing the process (Task Manager, `kill`) while it finishes can still leave a notice
-  half-recorded: then check the invoices the report shows as unfinished in QuickBooks and VShip. The report
-  marks the unfinished rows `INTERRUPTED`; run the file again to finish them.
+  `Failed_To_Process.txt`). Then the program prints the summary, rewrites the report and ends with exit code 3.
+  From the moment the changes start until the program ends only the first Ctrl+C stops the run: pressing Ctrl+C
+  again only repeats the message, however quickly, so wait for the program to end. When the output goes through a
+  pipe (`eta run … | tee run.log`, `| more`, PowerShell `| Tee-Object`), the same Ctrl+C usually ends the program
+  reading it, so the message and the summary are lost; the run still finishes as described and ends with exit
+  code 3, a warning on the error output says that the console output failed, and the log file
+  (`ETA_OUTPUT_DIR/logs`) has every line. A console that fails while the changes are applied (also a redirect to a
+  full disk) never stops the run. Closing the window, Ctrl+Break or killing the process (Task Manager, `kill`)
+  while it finishes ends it at once and can still leave a notice half-recorded; the report then still shows the
+  plan, so check the invoices it plans to change in QuickBooks and VShip. After Ctrl+C the report marks the
+  unfinished rows `INTERRUPTED`; run the file again to finish them.
 - A send that may have reached QuickBooks or the mail server is never retried. The ledger blocks a second e-mail
   for the same invoice on the same day, also after a send whose outcome is unknown (the error says
   `outcome unknown`); use `--force` only when you are sure the first one did not arrive. The ledger guards only

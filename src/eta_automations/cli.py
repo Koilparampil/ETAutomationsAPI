@@ -323,12 +323,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     "Press ENTER to close this window..." and wait — after success, failure or crash alike."""
     arguments = list(sys.argv[1:] if argv is None else argv)
     _configure_console()
-    if not arguments:
-        try:
-            return _main(["run"])
-        finally:
-            _pause_before_exit()
-    return _main(arguments)
+    try:
+        if not arguments:
+            try:
+                return _main(["run"])
+            finally:
+                _pause_before_exit()
+        return _main(arguments)
+    finally:
+        _settle_console()
 
 
 def _main(arguments: list[str]) -> int:
@@ -343,7 +346,8 @@ def _main(arguments: list[str]) -> int:
             return _cmd_version()
         return _with_settings(args)
     except KeyboardInterrupt:
-        print("\nInterrupted (Ctrl+C).", file=sys.stderr, flush=True)
+        with contextlib.suppress(OSError, ValueError):   # R2-01: best effort, the console may be gone (`2>&1 | tee`)
+            print("\nInterrupted (Ctrl+C).", file=sys.stderr, flush=True)
         return EXIT_ABORTED
     except Exception:  # noqa: BLE001 - 11 §3 exit 1: the traceback is printed and written to the log
         log.exception("Unexpected error — please keep the log file for the bug report")
@@ -367,6 +371,29 @@ def _configure_console() -> None:
         if callable(reconfigure):
             with contextlib.suppress(AttributeError, OSError, TypeError, ValueError):
                 reconfigure(encoding="utf-8", errors="replace")
+
+
+def _settle_console() -> None:
+    """Review fix R3-01: flush stdout and stderr before the exit code is returned. Output that a stream could not take
+    (`eta run … | tee run.log` whose tee ended with the Ctrl+C, a redirect to a full disk) stays buffered, and the
+    interpreter's own last flush at exit would fail again and replace the 11 §3 exit code with 120. Such a stream of
+    the process is pointed at the null device, so that last flush has nothing left to fail on; the lost text is in the
+    log file (the console is best effort from Phase 4 on, R2-01). Only the process's real standard streams are
+    redirected, never a stand-in that shares their file descriptor."""
+    for stream, process_stream in ((sys.stdout, sys.__stdout__), (sys.stderr, sys.__stderr__)):
+        if stream is None:
+            continue
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            if process_stream is None or stream is not process_stream:
+                continue
+            with contextlib.suppress(OSError, ValueError, AttributeError):    # io.UnsupportedOperation is both
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                try:
+                    os.dup2(devnull, stream.fileno())
+                finally:
+                    os.close(devnull)
 
 
 def _pause_before_exit() -> None:

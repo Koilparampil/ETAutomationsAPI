@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import errno
 import io
 import json
 import logging
@@ -54,7 +55,7 @@ from eta_automations.errors import (
 )
 from eta_automations.ledger import LEDGER_FILE_NAME
 from eta_automations.models import Carrier, OutputFile, Plan, Route
-from eta_automations.outputs import REPORT_COLUMNS, UTF8_BOM
+from eta_automations.outputs import REPORT_COLUMNS, UTF8_BOM, OutputWriter
 from eta_automations.pipeline import RunSummary, read_input, run
 from eta_automations.qbo.client import QboClient
 from eta_automations.qbo.email import (
@@ -715,6 +716,8 @@ async def test_no_recovery_file_means_no_repair_and_a_dry_run_only_warns(world: 
     dry = await run_pipeline(SCENARIOS["P4"](world), dry_run=True)
     assert world.calls.named("qbo.recover_email_template") == [] and world.qbo.write_attempts == []
     assert "may still be modified by a crashed run" in dry.out
+    # R2-03: a real run cannot restore every recovery file (another company's, a damaged one): it says why instead.
+    assert "a real run restores it before its prompt, or says why it cannot." in dry.out
 
 
 async def test_a_failed_template_repair_is_reported_prominently(world: FakeWorld, run_pipeline: Runner,
@@ -727,35 +730,28 @@ async def test_a_failed_template_repair_is_reported_prominently(world: FakeWorld
     assert res.plan("EBKG10000004").status == "OK"         # the ETA updates are not affected
 
 
-def unusable_recovery_file(path: Path, problem: str) -> EmailPathUnavailableError:
-    """What QboClient.recover_email_template() raises for a recovery file this company cannot use (NEW-03)."""
-    error: EmailPathUnavailableError
-    if problem == "another company":
-        error = EmailPathUnavailableError(f"recovery file belongs to another QuickBooks company: {path}")
-    else:
-        error = TemplateRestoreError(f"The e-mail template recovery file {path} is not valid JSON. Check the invoice "
-                                     "e-mail subject in QuickBooks (Settings → Account and settings → Sales → "
-                                     "Messages), then delete the file.")
+def another_company_s_recovery_file(path: Path) -> EmailPathUnavailableError:
+    """What QboClient.recover_email_template() raises for a recovery file of another QuickBooks company (NEW-03)."""
+    error = EmailPathUnavailableError(f"recovery file belongs to another QuickBooks company: {path}")
     error.recovery_file_unusable = True
     return error
 
 
-@pytest.mark.parametrize("problem", ["another company", "unreadable"])
 @pytest.mark.parametrize(("case", "env", "no_email"), [
     ("graph sends", GRAPH_ENV, False),
     ("--no-email", {}, True),
     ("no e-mail rows", {}, False),
 ])
-async def test_a_recovery_file_this_company_cannot_use_only_warns_a_run_without_template_swap_e_mails(
+async def test_a_recovery_file_of_another_company_only_warns_a_run_without_template_swap_e_mails(
         world: FakeWorld, run_pipeline: Runner, state_dir: Path, caplog: pytest.LogCaptureFixture, case: str,
-        env: dict[str, str], no_email: bool, problem: str) -> None:
-    """NEW-03: a recovery file of another QuickBooks company (e.g. a sandbox crash before switching to production), or
-    one that cannot be read, says nothing about this company's template and does not touch a run that e-mails nothing
-    through template_swap: a WARNING names the file and the reason, the run goes on and exits 0 (a template_swap run
-    that e-mails still stops its e-mails, see the next test)."""
+        env: dict[str, str], no_email: bool) -> None:
+    """NEW-03 / R2-03: a recovery file of another QuickBooks company (e.g. a sandbox crash before switching to
+    production) says nothing about this company's template and does not touch a run that e-mails nothing through
+    template_swap: a WARNING names the file and the reason, the run goes on and exits 0 (a template_swap run that
+    e-mails still stops its e-mails, see below). A damaged file is another matter (next test)."""
     path = state_dir / RECOVERY_FILE_NAME
     path.write_text("{}", encoding="utf-8")
-    error = unusable_recovery_file(path, problem)
+    error = another_company_s_recovery_file(path)
     world.qbo.recover_error = error
     rows = SCENARIOS["P4"](world) if case == "no e-mail rows" else SCENARIOS["P1"](world)
     with caplog.at_level(logging.WARNING, logger="eta.pipeline"):
@@ -793,13 +789,58 @@ async def test_a_recovery_file_of_another_company_with_the_real_qbo_client_only_
                for r in caplog.records if r.name == "eta.pipeline")
 
 
+@pytest.mark.parametrize(("content", "problem"), [
+    ("{not json", "is not valid JSON."),
+    (b"\xff\xfe{", "cannot be read (UnicodeDecodeError)."),
+    (json.dumps({"realm_id": "1234567890", "swapped_subject": SUBJECT_P1}), "has no original subject"),
+    (json.dumps({"original_subject": "Invoice [Invoice No.]", "swapped_subject": SUBJECT_P1}),
+     "names no QuickBooks company."),
+], ids=["not JSON", "not UTF-8", "this company's, no original subject", "no company"])
+@pytest.mark.parametrize(("case", "env", "no_email"), [
+    ("graph, ETA update only", GRAPH_ENV, False),
+    ("--no-email", {}, True),
+])
+async def test_a_damaged_recovery_file_or_this_company_s_without_an_original_subject_is_reported_and_exits_4(
+        world: FakeWorld, run_pipeline: Runner, make_settings: Callable[..., Settings], state_dir: Path,
+        caplog: pytest.LogCaptureFixture, content: str | bytes, problem: str, case: str, env: dict[str, str],
+        no_email: bool) -> None:
+    """R2-03 end to end with the real QboClient: a recovery file that cannot be read or is damaged, and this company's
+    file without an original subject, mean a template_swap run of this company may have crashed between swap and
+    restore: its invoice e-mail subject may still name another customer's booking and cannot be restored
+    automatically. A run that e-mails nothing through template_swap therefore prints the banner with what to do (check
+    the subject in QuickBooks, then delete the file), repeats it with the summary and exits 4, as before NEW-03; its
+    changes are still applied and the file is left for the person to check."""
+    import respx
+
+    path = state_dir / RECOVERY_FILE_NAME
+    if isinstance(content, bytes):
+        path.write_bytes(content)
+    else:
+        path.write_text(content, encoding="utf-8")
+    qbo_settings = make_settings(env).qbo
+    assert qbo_settings is not None
+    real = QboClient(qbo_settings, world.qbo.auth, state_dir=state_dir)  # type: ignore[arg-type]
+    world.qbo.recover_email_template = real.recover_email_template  # type: ignore[method-assign]
+    rows = SCENARIOS["P1"](world) if no_email else SCENARIOS["P4"](world)
+    with respx.mock(assert_all_mocked=True), caplog.at_level(logging.WARNING, logger="eta"):
+        res = await run_pipeline(rows, env=env, no_email=no_email)
+        await real.aclose()
+    assert (res.summary.exit_code, res.summary.email_blocked) == (4, False)
+    banner = res.out.split("THE QUICKBOOKS INVOICE E-MAIL TEMPLATE COULD NOT BE RESTORED:\n", 1)[1].split("\n", 1)[0]
+    assert str(path) in banner and problem in banner, banner
+    assert "invoice e-mail subject in QuickBooks" in banner and banner.endswith("then delete the file.")
+    assert "The QuickBooks invoice e-mail template must be restored by hand:\n" + banner in res.out
+    assert [p.status for p in res.summary.plans] == ["OK"] and path.exists()
+    assert not any("was left as it is" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+
+
 async def test_a_recovery_file_of_another_company_still_stops_template_swap_e_mails(world: FakeWorld,
                                                                                     run_pipeline: Runner,
                                                                                     state_dir: Path) -> None:
     """NEW-03: a run that e-mails through template_swap keeps the hard failure of its preflight (04b §6.2 step 1)."""
     path = state_dir / RECOVERY_FILE_NAME
     path.write_text("{}", encoding="utf-8")
-    world.qbo.prepare_error = unusable_recovery_file(path, "another company")
+    world.qbo.prepare_error = another_company_s_recovery_file(path)
     res = await run_pipeline(SCENARIOS["P1"](world))
     assert (res.summary.exit_code, res.summary.email_blocked) == (4, True)
     assert world.calls.named("qbo.send_invoice") == [] and world.calls.named("qbo.recover_email_template") == []
@@ -1903,6 +1944,358 @@ def test_ctrl_c_outside_the_main_thread_still_finishes_the_started_changes(
     assert outcome["report"]["rows"][0]["status"] == "INTERRUPTED"
     assert world.writes()[-1] == note(b.vship_id, "ARRIVED ON 11/03. NOTIF #1")
     assert signal.getsignal(signal.SIGINT) is before
+
+
+class FailingConsole(io.StringIO):
+    """A console that stops working: stdout of `eta run … --yes | tee run.log` (or `| more`) once its reader ended
+    with the same Ctrl+C (BrokenPipeError), a redirect to a full disk (OSError), a closed stream (ValueError). Once
+    `broken` is set, every write and flush raises."""
+
+    def __init__(self, error: Callable[[], Exception]) -> None:
+        super().__init__()
+        self.error = error
+        self.broken = False
+        self.failures = 0
+
+    def _check(self) -> None:
+        if self.broken:
+            self.failures += 1
+            raise self.error()
+
+    def write(self, text: str) -> int:
+        self._check()
+        return super().write(text)
+
+    def flush(self) -> None:
+        self._check()
+        super().flush()
+
+
+CONSOLE_ERRORS: dict[str, Callable[[], Exception]] = {
+    "broken pipe": lambda: BrokenPipeError(errno.EPIPE, "Broken pipe"),
+    "disk full": lambda: OSError(errno.ENOSPC, "No space left on device"),
+    "closed": lambda: ValueError("I/O operation on closed file."),
+}
+
+
+def interrupted_report(settings: Settings) -> dict[str, Any]:
+    report: dict[str, Any] = json.loads(
+        (settings.run.output_dir / "reports" / f"run_{RUN_ID}.json").read_text(encoding="utf-8"))
+    return report
+
+
+@pytest.mark.parametrize("failure", list(CONSOLE_ERRORS))
+@pytest.mark.parametrize("method", ["qbo.update_invoice", "qbo.send_invoice"])
+async def test_a_console_that_fails_at_ctrl_c_does_not_stop_the_drain(
+        world: FakeWorld, make_settings: Callable[..., Settings], tmp_path: Path, fixed_clock: FixedClock,
+        asyncio_run_sigint: FakeAsyncioRunSigint, method: str, failure: str) -> None:
+    """R2-01: with `eta run … --yes | tee run.log` the terminal sends Ctrl+C to tee as well, so the stop message can no
+    longer be printed. That must not skip the drain: the write in flight finishes with the revert (QBO update) or the
+    VShip note (e-mail) that keeps its notice whole (RUL-01), the plan is INTERRUPTED and the report is rewritten.
+    Before the fix the failing print raised out of the drain before the row task was cancelled or awaited, and
+    asyncio.run() then cancelled the shielded writes: a lone suffix, or an e-mail without its note, and exit code 1."""
+    b = world.add("EBKG10000001", "2450.00", eta=ARRIVED)
+    settings = make_settings()
+    console = FailingConsole(CONSOLE_ERRORS[failure])
+    entered, gate = asyncio.Event(), asyncio.Event()
+
+    async def hold(name: str, target: Any) -> None:
+        if name == method and not gate.is_set():
+            entered.set()
+            await gate.wait()
+
+    world.qbo.before_write = hold
+    task = asyncio.create_task(run(settings, write_input(tmp_path, [b]), assume_yes=True, clock=fixed_clock,
+                                   services=world.services(settings), out=console))
+    await asyncio.wait_for(entered.wait(), 5)
+    console.broken = True                 # the console is gone with the same Ctrl+C ...
+    task.cancel()                         # ... that cancels the run (asyncio.run())
+    await spin()
+    assert not task.done()                # still finishing the write in flight
+    second_ctrl_c()                       # a further Ctrl+C only tries to repeat the message
+    await spin()
+    assert asyncio_run_sigint.calls == [] and not task.done()
+    gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert console.failures >= 3          # the stop message, its repeat and the summary could not be printed
+    suffix = upd("EBKG10000001", date(2026, 11, 3), "EBKG10000001 A")
+    if method == "qbo.update_invoice":
+        assert world.writes() == [suffix, upd("EBKG10000001 A", None, "EBKG10000001")]
+    else:
+        assert world.writes() == [suffix, send("EBKG10000001 A", SUBJECT_P1),
+                                  note(b.vship_id, "ARRIVED ON 11/03. NOTIF #1")]
+    report = interrupted_report(settings)
+    assert (report["report_stage"], report["rows"][0]["status"]) == ("interrupted", "INTERRUPTED")
+    assert asyncio.all_tasks() == {asyncio.current_task()}          # no row task was left behind
+
+
+async def test_a_console_that_fails_while_stopping_does_not_stop_the_run_from_finishing(
+        world: FakeWorld, make_settings: Callable[..., Settings], tmp_path: Path, fixed_clock: FixedClock,
+        asyncio_run_sigint: FakeAsyncioRunSigint, caplog: pytest.LogCaptureFixture) -> None:
+    """R2-01: the console breaks after the stop message was printed (`| more` was quit meanwhile). The message a
+    further Ctrl+C repeats, the `Interrupted: …` line and the summary cannot be printed: that is all. The e-mail in
+    flight still gets its VShip note, the report is rewritten, the event loop reports no failed callback and the log
+    says once that the console failed."""
+    b = world.add("EBKG10000001", "2450.00", eta=ARRIVED)
+    settings = make_settings()
+    console = FailingConsole(CONSOLE_ERRORS["broken pipe"])
+    entered, gate = asyncio.Event(), asyncio.Event()
+
+    async def hold(name: str, target: Any) -> None:
+        if name == "qbo.send_invoice" and not gate.is_set():
+            entered.set()
+            await gate.wait()
+
+    world.qbo.before_write = hold
+    loop = asyncio.get_running_loop()
+    loop_errors: list[dict[str, Any]] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    try:
+        with caplog.at_level(logging.WARNING, logger="eta.pipeline"):
+            task = asyncio.create_task(run(settings, write_input(tmp_path, [b]), assume_yes=True, clock=fixed_clock,
+                                           services=world.services(settings), out=console))
+            await asyncio.wait_for(entered.wait(), 5)
+            task.cancel()
+            await spin()
+            assert console.getvalue().count(STOP_HINT) == 1
+            console.broken = True
+            second_ctrl_c()
+            await spin()
+            assert loop_errors == [] and asyncio_run_sigint.calls == [] and not task.done()
+            gate.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    finally:
+        loop.set_exception_handler(previous)
+    assert loop_errors == []
+    assert world.writes()[-1] == note(b.vship_id, "ARRIVED ON 11/03. NOTIF #1")
+    report = interrupted_report(settings)
+    assert (report["report_stage"], report["rows"][0]["status"]) == ("interrupted", "INTERRUPTED")
+    failed = [r.getMessage() for r in caplog.records if "Console output failed" in r.getMessage()]
+    assert len(failed) == 1 and "BrokenPipeError" in failed[0], failed
+
+
+@pytest.mark.parametrize("restore_fails", [False, True], ids=["sent", "sent, template not restored"])
+async def test_a_console_that_fails_while_changes_are_applied_does_not_stop_the_run(
+        world: FakeWorld, make_settings: Callable[..., Settings], tmp_path: Path, fixed_clock: FixedClock,
+        restore_fails: bool) -> None:
+    """R2-01: once Phase 4 changes things, the console is best effort, with or without Ctrl+C. Here it breaks while the
+    e-mail is sent: the row still gets its VShip note and ETA, and the final report is written. With a template that
+    could not be restored after the send (04b §6.2 step 3.5), the banner it prints must not cost the note either."""
+    b = world.add("EBKG10000001", "2450.00", eta=ARRIVED)
+    assert b.invoice_id is not None
+    settings = make_settings()
+    console = FailingConsole(CONSOLE_ERRORS["broken pipe"])
+    if restore_fails:
+        error = TemplateRestoreError(f"{RESTORE_MSG} (The invoice e-mail for #EBKG10000001 A WAS sent before the "
+                                     "restore failed.)")
+        error.receipt = SendReceipt(strategy="template_swap", invoice_id=b.invoice_id,  # type: ignore[attr-defined]
+                                    doc_number="EBKG10000001 A", subject=SUBJECT_P1, to=(DEFAULT_EMAIL,),
+                                    sent_at=fixed_clock.now())
+        world.qbo.send_errors[b.invoice_id] = error
+
+    async def hold(name: str, target: Any) -> None:
+        if name == "qbo.send_invoice":
+            console.broken = True
+
+    world.qbo.before_write = hold
+    summary = await run(settings, write_input(tmp_path, [b]), assume_yes=True, clock=fixed_clock,
+                        services=world.services(settings), out=console)
+    assert world.writes() == [upd("EBKG10000001", date(2026, 11, 3), "EBKG10000001 A"),
+                              send("EBKG10000001 A", SUBJECT_P1),
+                              note(b.vship_id, "ARRIVED ON 11/03. NOTIF #1"), patch(b.vship_id, "2026-11-03T00:00:00")]
+    assert console.failures > 0
+    assert (summary.exit_code, summary.ok) == ((4, 1) if restore_fails else (0, 1))
+    report = json.loads((summary.report_json or Path("missing")).read_text(encoding="utf-8"))
+    assert (report["report_stage"], report["exit_code"], report["rows"][0]["status"]) == (
+        "final", summary.exit_code, "OK")
+
+
+def press_ctrl_c() -> None:
+    """Call the SIGINT handler that is installed now, as a Ctrl+C would (no real signal is sent)."""
+    handler = signal.getsignal(signal.SIGINT)
+    assert callable(handler), handler
+    handler(signal.SIGINT, None)
+
+
+@pytest.mark.parametrize("method", ["qbo.update_invoice", "qbo.send_invoice"])
+def test_two_quick_ctrl_c_presses_under_asyncio_run_still_finish_the_notice(
+        world: FakeWorld, make_settings: Callable[..., Settings], tmp_path: Path, fixed_clock: FixedClock,
+        method: str) -> None:
+    """R2-02: under asyncio.run(), as in `eta run`, the first Ctrl+C cancels the run and a later one becomes
+    KeyboardInterrupt, after which asyncio.run() cancels every task, the shielded writes included. Here both come while
+    a write is in flight, before the run could begin to stop (the event loop was busy, e.g. with a slow fsync of the
+    ledger). The guard installed when Phase 4 started applying changes passes the first one on to asyncio.run() and
+    only repeats the stop message for the second: the write gets its revert or VShip note, the report is rewritten and
+    asyncio.run() still ends with KeyboardInterrupt (exit code 3). Before the fix the guard came with the stop message
+    only, so the second Ctrl+C reached asyncio.run() and split the notice."""
+    b = world.add("EBKG10000001", "2450.00", eta=ARRIVED)
+    settings = make_settings()
+    out = io.StringIO()
+    pressed: list[bool] = []
+
+    async def hold(name: str, target: Any) -> None:
+        if name == method and not pressed:
+            pressed.append(True)
+            press_ctrl_c()                    # the first Ctrl+C: asyncio.run() cancels the run ...
+            press_ctrl_c()                    # ... and a second one comes before the run could begin to stop
+            for _ in range(10):
+                await asyncio.sleep(0)        # the write is still in flight
+
+    world.qbo.before_write = hold
+
+    async def main() -> RunSummary:
+        return await run(settings, write_input(tmp_path, [b]), assume_yes=True, clock=fixed_clock,
+                         services=world.services(settings), out=out)
+
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler    # so asyncio.run() installs its own
+    with pytest.raises(KeyboardInterrupt):    # how asyncio.run() ends after a Ctrl+C: the CLI's exit code 3
+        asyncio.run(main())
+    assert pressed and signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    suffix = upd("EBKG10000001", date(2026, 11, 3), "EBKG10000001 A")
+    if method == "qbo.update_invoice":
+        assert world.writes() == [suffix, upd("EBKG10000001 A", None, "EBKG10000001")]
+    else:
+        assert world.writes() == [suffix, send("EBKG10000001 A", SUBJECT_P1),
+                                  note(b.vship_id, "ARRIVED ON 11/03. NOTIF #1")]
+    assert out.getvalue().count(STOP_HINT) == 2       # at the stop, and again for the second Ctrl+C
+    report = interrupted_report(settings)
+    assert (report["report_stage"], report["rows"][0]["status"]) == ("interrupted", "INTERRUPTED")
+
+
+def test_a_ctrl_c_that_reached_asyncio_run_just_before_phase_4_lets_a_second_one_only_repeat_the_message(
+        world: FakeWorld, make_settings: Callable[..., Settings], tmp_path: Path, fixed_clock: FixedClock,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """R2-02: the first Ctrl+C reached asyncio.run()'s own handler just before Phase 4 (while the plan report was
+    written), so the run is already being cancelled when Phase 4 begins. A second Ctrl+C right after (while step 1
+    writes the routed entries) must not be passed on to asyncio.run(), which would raise KeyboardInterrupt and cancel
+    every task: it only repeats the stop message, and the change that started is put back."""
+    b = world.add("EBKG10000001", "2450.00", eta=ARRIVED)
+    bindu = world.add("EBKG10000013", "850")
+    settings = make_settings()
+    out = io.StringIO()
+    pressed: list[str] = []
+    real_report, real_write = pipeline.write_report, OutputWriter.write
+
+    def report_and_press(*args: Any, **kwargs: Any) -> Any:
+        result = real_report(*args, **kwargs)
+        if not pressed:
+            pressed.append("first")
+            press_ctrl_c()                    # asyncio.run()'s handler: the run is cancelled at its next await
+        return result
+
+    def write_and_press(self: OutputWriter, file: OutputFile, entry: Any) -> Any:
+        result = real_write(self, file, entry)
+        if pressed == ["first"]:
+            pressed.append("second")
+            press_ctrl_c()
+        return result
+
+    monkeypatch.setattr(pipeline, "write_report", report_and_press)
+    monkeypatch.setattr(OutputWriter, "write", write_and_press)
+
+    async def main() -> RunSummary:
+        return await run(settings, write_input(tmp_path, [bindu, b]), assume_yes=True, clock=fixed_clock,
+                         services=world.services(settings), out=out)
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(main())
+    assert pressed == ["first", "second"]
+    assert world.writes() == [upd("EBKG10000001", date(2026, 11, 3), "EBKG10000001 A"),
+                              upd("EBKG10000001 A", None, "EBKG10000001")]
+    assert out.getvalue().count(STOP_HINT) == 2
+    report = interrupted_report(settings)
+    assert (report["report_stage"], [r["status"] for r in report["rows"]]) == ("interrupted", ["ROUTED", "INTERRUPTED"])
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+
+
+async def test_the_ctrl_c_guard_is_in_place_while_changes_are_applied_and_put_back_on_every_exit(
+        world: FakeWorld, make_settings: Callable[..., Settings], tmp_path: Path, fixed_clock: FixedClock,
+        asyncio_run_sigint: FakeAsyncioRunSigint, monkeypatch: pytest.MonkeyPatch) -> None:
+    """R2-02: the guard replaces the SIGINT handler from the start of Phase 4, before any row task runs, until the run
+    has ended: it is put back after a normal end and after an unexpected error alike."""
+    seen: list[Any] = []
+
+    async def hold(name: str, target: Any) -> None:
+        seen.append(signal.getsignal(signal.SIGINT))
+
+    world.qbo.before_write = hold
+    settings = make_settings()
+    b = world.add("EBKG10000001", "2450.00", eta=ARRIVED)
+    summary = await run(settings, write_input(tmp_path, [b]), assume_yes=True, clock=fixed_clock,
+                        services=world.services(settings), out=io.StringIO())
+    assert summary.exit_code == 0 and len(seen) == 2          # the QBO update and the e-mail
+    assert all(h is not asyncio_run_sigint.handler and getattr(h, "__self__", None) is not None for h in seen)
+    assert signal.getsignal(signal.SIGINT) is asyncio_run_sigint.handler
+
+    real_report = pipeline.write_report
+
+    def broken_final_report(output_dir: Path, run_id: str, rows: Any, meta: Mapping[str, Any]) -> Any:
+        if meta["report_stage"] == "final":
+            raise RuntimeError("report writer bug")
+        return real_report(output_dir, run_id, rows, meta)
+
+    world2 = FakeWorld(fixed_clock)
+    world2.qbo.before_write = hold
+    b2 = world2.add("EBKG10000002", "2450.00", eta=ARRIVED)
+    monkeypatch.setattr(pipeline, "write_report", broken_final_report)
+    with pytest.raises(RuntimeError, match="report writer bug"):      # (force: world2 reuses invoice id 1001)
+        await run(settings, write_input(tmp_path, [b2], "second.csv"), assume_yes=True, force=True,
+                  clock=fixed_clock, services=world2.services(settings), out=io.StringIO())
+    assert len(seen) == 4 and getattr(seen[-1], "__self__", None) is not None
+    assert signal.getsignal(signal.SIGINT) is asyncio_run_sigint.handler
+    assert asyncio_run_sigint.calls == []
+
+
+async def test_a_ctrl_c_that_arrives_while_the_guard_is_installed_is_passed_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R3-02: a Ctrl+C can reach the guard's handler as soon as signal.signal() has put it in place, before install()
+    has returned. It is the first Ctrl+C, so it goes on to the handler it replaced (asyncio.run(): the run is cancelled
+    and ends with exit code 3); before the fix the handler did not know that one yet and only printed the stop
+    message, while the run went on. If signal.signal() fails, nothing is installed and restore() changes nothing."""
+    passed_on: list[int] = []
+    warned: list[str] = []
+
+    def previous(signum: int, frame: Any) -> None:            # asyncio.run()'s handler, emulated
+        passed_on.append(signum)
+
+    real_signal = signal.signal
+    original = signal.getsignal(signal.SIGINT)
+    task = asyncio.current_task()
+    assert task is not None
+    guard = pipeline._SigintGuard(asyncio.get_running_loop(), task, lambda: warned.append("stop message"))
+
+    def install_then_ctrl_c(signum: int, handler: Any) -> Any:
+        replaced = real_signal(signum, handler)
+        if handler == guard._handle:
+            handler(signal.SIGINT, None)                       # the Ctrl+C arrives before signal.signal() returns
+        return replaced
+
+    real_signal(signal.SIGINT, previous)
+    try:
+        monkeypatch.setattr(signal, "signal", install_then_ctrl_c)
+        guard.install()
+        monkeypatch.setattr(signal, "signal", real_signal)
+        await spin()
+        assert (passed_on, warned) == ([signal.SIGINT], [])
+        guard._handle(signal.SIGINT, None)                     # a later one only repeats the stop message
+        await spin()
+        assert (passed_on, warned) == ([signal.SIGINT], ["stop message"])
+        guard.restore()
+        assert signal.getsignal(signal.SIGINT) is previous
+
+        def not_the_main_thread(signum: int, handler: Any) -> Any:
+            raise ValueError("signal only works in main thread of the main interpreter")
+
+        failing = pipeline._SigintGuard(asyncio.get_running_loop(), task, lambda: warned.append("stop message"))
+        monkeypatch.setattr(signal, "signal", not_the_main_thread)
+        failing.install()
+        monkeypatch.setattr(signal, "signal", real_signal)
+        failing.restore()
+        assert signal.getsignal(signal.SIGINT) is previous and failing._previous is None
+    finally:
+        real_signal(signal.SIGINT, original)
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════

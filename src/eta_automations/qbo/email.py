@@ -372,10 +372,24 @@ def _outcome_unknown(exc: InvoiceSendError) -> InvoiceSendError:
 
 
 def _unusable_recovery_file[E: EmailPathUnavailableError](exc: E) -> E:
-    """Mark an error about a recovery file this company cannot use — another company's, or unreadable (review fix
-    NEW-03): only a run that e-mails through template_swap stops for it; any other run warns and goes on."""
+    """Mark the error about a readable recovery file of another QuickBooks company (review fixes NEW-03, R2-03): it
+    says nothing about this company's template, so only a run that e-mails through template_swap stops for it; any
+    other run warns and goes on. A damaged file is not marked: this company's template may still be swapped."""
     exc.recovery_file_unusable = True
     return exc
+
+
+_CHECK_SUBJECT_BY_HAND = ("Check the invoice e-mail subject in QuickBooks (Settings → Account and settings → Sales → "
+                          "Messages), then delete the file.")
+
+
+def _recovery_realm(record: Mapping[str, Any]) -> str | None:
+    """The QuickBooks company (realm id) a recovery record names, or None when it names none — a damaged record, since
+    _write_recovery always writes it (review fix R2-03)."""
+    realm = record.get("realm_id")
+    if isinstance(realm, bool) or not isinstance(realm, (str, int)) or not str(realm).strip():
+        return None
+    return str(realm)
 
 
 def _swap_redirect(settings: QboSettings, inv: InvoiceSnapshot) -> tuple[str | None, str | None]:
@@ -489,28 +503,25 @@ class TemplateSwapEmailer:
 
     # ── files ──
     def _load_recovery(self) -> dict[str, Any] | None:
-        """The recovery record, or None when there is no file. An unreadable file raises TemplateRestoreError marked
-        `recovery_file_unusable` (review fix NEW-03)."""
+        """The recovery record, or None when there is no file. A file that cannot be read raises TemplateRestoreError
+        with what to do; it is not marked `recovery_file_unusable` (review fix R2-03): it may be this company's own."""
         try:
             text = self.recovery_path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
         except (OSError, UnicodeError) as exc:
-            raise _unusable_recovery_file(TemplateRestoreError(
+            raise TemplateRestoreError(
                 f"The e-mail template recovery file {self.recovery_path} cannot be read ({type(exc).__name__}). "
-                "Check the invoice e-mail subject in QuickBooks (Settings → Account and settings → Sales → "
-                "Messages), then delete the file.")) from exc
+                + _CHECK_SUBJECT_BY_HAND) from exc
         try:
             data = json.loads(text)
         except ValueError as exc:
-            raise _unusable_recovery_file(TemplateRestoreError(
-                f"The e-mail template recovery file {self.recovery_path} is not valid JSON. Check the invoice "
-                "e-mail subject in QuickBooks (Settings → Account and settings → Sales → Messages), then delete "
-                "the file.")) from exc
+            raise TemplateRestoreError(f"The e-mail template recovery file {self.recovery_path} is not valid JSON. "
+                                       + _CHECK_SUBJECT_BY_HAND) from exc
         if not isinstance(data, dict):
-            raise _unusable_recovery_file(TemplateRestoreError(
+            raise TemplateRestoreError(
                 f"The e-mail template recovery file {self.recovery_path} has an unexpected format. Check the "
-                "invoice e-mail subject in QuickBooks, then delete the file."))
+                "invoice e-mail subject in QuickBooks, then delete the file.")
         return data
 
     def _write_recovery(self, subject: str, invoice_id: str) -> None:
@@ -638,20 +649,26 @@ class TemplateSwapEmailer:
                 self._ready = True
 
     def _checked_recovery_record(self) -> dict[str, Any] | None:
-        """The recovery record of this company with a usable original subject, or None when there is none. A file this
-        company cannot use (another company's, unreadable, no original subject) raises an error marked
-        `recovery_file_unusable` (review fix NEW-03)."""
+        """The recovery record of this company with a usable original subject, or None when there is none. A readable
+        record of another company raises the 04b §6.2 step 1 EmailPathUnavailableError, marked
+        `recovery_file_unusable` (review fix NEW-03). Every other problem — the file cannot be read, is damaged or names
+        no company, or is this company's without an original subject — raises TemplateRestoreError with what to do,
+        unmarked (review fix R2-03): this company's template may still be swapped and needs a person."""
         record = self._load_recovery()
         if record is None:
             return None
-        if str(record.get("realm_id")) != str(self._s.realm_id):
+        realm = _recovery_realm(record)
+        if realm is None:
+            raise TemplateRestoreError(f"The e-mail template recovery file {self.recovery_path} names no QuickBooks "
+                                       "company. " + _CHECK_SUBJECT_BY_HAND)
+        if realm != str(self._s.realm_id):
             raise _unusable_recovery_file(EmailPathUnavailableError(
                 f"recovery file belongs to another QuickBooks company: {self.recovery_path}"))
         original_subject = record.get("original_subject")
         if not isinstance(original_subject, str) or not original_subject:
-            raise _unusable_recovery_file(TemplateRestoreError(
-                f"The recovery file {self.recovery_path} has no original subject — check the QuickBooks invoice "
-                "e-mail subject manually, then delete the file."))
+            raise TemplateRestoreError(
+                f"The recovery file {self.recovery_path} has no original subject — check the invoice e-mail subject in "
+                "QuickBooks (Settings → Account and settings → Sales → Messages), then delete the file.")
         return record
 
     async def recover(self) -> bool:
@@ -909,19 +926,16 @@ class TemplateSwapEmailer:
                         "next real run.", self.recovery_path)
             return
         try:
-            record = self._load_recovery()
-            if record is None:
-                return
-            if str(record.get("realm_id")) != str(self._s.realm_id):
-                log.error("%s belongs to another QuickBooks company — not touching it", self.recovery_path)
-                return
-            original_subject = record.get("original_subject")
-            if not isinstance(original_subject, str) or not original_subject:
-                log.error("%s has no original subject — check the QuickBooks invoice e-mail subject manually",
-                          self.recovery_path)
-                return
+            record = self._checked_recovery_record()
+        except Exception as exc:  # noqa: BLE001 - another company's or a damaged file (R2-03): its error says what to do
+            log.error("The QuickBooks e-mail template recovery file was left as it is at shutdown: %s", exc)
+            return
+        if record is None:
+            return
+        try:
             message = record.get("original_message")
-            self._original = TemplateText(original_subject, message if isinstance(message, str) else None)
+            self._original = TemplateText(str(record["original_subject"]),
+                                          message if isinstance(message, str) else None)
             await self._restore()
         except Exception as exc:  # noqa: BLE001 - cleanup must not raise; the instructions are logged
             log.error("The QuickBooks invoice e-mail subject could not be restored at shutdown: %s", exc)
