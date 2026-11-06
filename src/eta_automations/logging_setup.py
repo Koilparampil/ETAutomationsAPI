@@ -69,8 +69,9 @@ _AUTH_SCHEME_RE = re.compile(
     r"""(?i)(?P<pre>\b(?:proxy-)?authorization["']?\s*[:=]\s*["']?\s*)"""
     r"""(?P<scheme>basic|bearer|digest|negotiate|ntlm|token)\s+(?P<cred>[^\s"',;]+)"""
 )
-# 03 §11: "Bearer <x>" → "Bearer ***" anywhere in a string.
-_BEARER_RE = re.compile(r"(?i)\b(?P<scheme>bearer)\s+(?P<tok>[A-Za-z0-9\-._~+/]+=*)")
+# 03 §11: "Bearer <x>" → "Bearer ***" anywhere in a string — except a URL path segment such as QuickBooks'
+# token endpoint ".../oauth2/v1/tokens/bearer", whose following word is log text, not a credential.
+_BEARER_RE = re.compile(r"(?i)(?<!/)\b(?P<scheme>bearer)\s+(?P<tok>[A-Za-z0-9\-._~+/]+=*)")
 # URL query parameters / form fields / env-style assignments / HTML bodies: key=value, where the key is
 # not preceded by another key character.
 _KEY_VALUE_RE = re.compile(

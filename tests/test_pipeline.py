@@ -699,10 +699,37 @@ async def test_qbo_auth_failure_exits_2(world: FakeWorld, run_pipeline: Runner,
 
 
 async def test_vship_auth_failure_exits_2(world: FakeWorld, run_pipeline: Runner) -> None:
-    world.vship.auth.error = ServiceError("vship", "network error: ConnectError()")
+    world.vship.auth.error = AuthError("VShip rejected the login (HTTP 401)")
     res = await run_pipeline(SCENARIOS["P1"](world))
     assert res.summary.exit_code == 2 and "VShip authentication failed" in res.summary.message
     assert "VSHIP_USER_NAME" in res.summary.message
+
+
+async def test_unreachable_service_at_login_exits_2_with_a_network_hint(world: FakeWorld,
+                                                                         run_pipeline: Runner) -> None:
+    """Phase 0 step 6: a network error is not a credential problem, so the hint names the connection."""
+    world.vship.auth.error = ServiceError("vship", "network error: ConnectError()")
+    res = await run_pipeline(SCENARIOS["P1"](world))
+    assert res.summary.exit_code == 2
+    assert res.summary.message == (
+        "VShip authentication failed: vship: network error: ConnectError()\n"
+        "VShip could not be reached: check the network connection and the proxy settings (HTTPS_PROXY), then "
+        "retry (`eta probe vship` shows details).")
+    assert world.writes() == [] and world.carriers[Carrier.MSC].get_eta_calls == []
+
+    world.vship.auth.error = None
+    world.qbo.auth.error = ServiceError("qbo-oauth", "unexpected HTTP 503 for POST /oauth2/v1/tokens/bearer",
+                                        status=503)
+    res = await run_pipeline(SCENARIOS["P1"](world))
+    assert res.summary.exit_code == 2
+    assert res.summary.message.endswith(
+        "QuickBooks answered HTTP 503 to the login: retry later (`eta probe qbo` shows details).")
+    assert "eta qbo-auth" not in res.summary.message
+
+    world.qbo.auth.error = ServiceError("qbo-oauth", "unexpected HTTP 401 for POST /oauth2/v1/tokens/bearer",
+                                        status=401)
+    res = await run_pipeline(SCENARIOS["P1"](world))
+    assert res.summary.exit_code == 2 and "Run `eta qbo-auth`" in res.summary.message   # a credential verdict
 
 
 async def test_missing_required_settings_exit_2(world: FakeWorld, run_pipeline: Runner) -> None:

@@ -109,6 +109,12 @@ def test_redact_scalars_unchanged(value: object) -> None:
     ("Invoice for Booking no. EBKG12345678. ***ESTIMATED ARRIVING ON 11/08.****",
      "Invoice for Booking no. EBKG12345678. ***ESTIMATED ARRIVING ON 11/08.****"),
     ("filters[booking_number]=eq:EBKG1&take=25", "filters[booking_number]=eq:EBKG1&take=25"),
+    # the QuickBooks token endpoint path ends in /bearer: the next word of an eta.http log line is no credential
+    ("POST https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer -> ConnectError in 41 ms (attempt 1/4)",
+     "POST https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer -> ConnectError in 41 ms (attempt 1/4)"),
+    ("retrying POST https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer in 0.64 s",
+     "retrying POST https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer in 0.64 s"),
+    ("POST /oauth2/v1/tokens/bearer with Bearer abc.def", "POST /oauth2/v1/tokens/bearer with Bearer ***"),
 ])
 def test_redact_strings(text: str, expected: str) -> None:
     assert redact(text) == expected

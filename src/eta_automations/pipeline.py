@@ -120,6 +120,7 @@ _CARRIER_KINDS = frozenset({RowKind.STANDARD, RowKind.NOTIF1_SENT})
 _YES = frozenset({"y", "yes"})
 _BANNER = "!" * 78
 _MAX_DOCS_SHOWN = 5
+_CREDENTIAL_STATUSES = frozenset({400, 401, 403})   # a login answered like this points at the credentials
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -318,6 +319,15 @@ def _receipt_detail(receipt: Any) -> dict[str, Any]:
     }
 
 
+def _service_hint(name: str, exc: ServiceError, probe: str) -> str:
+    """Phase 0 step 6 hint for a login that failed without a credential verdict (03 §6: network error or an
+    unexpected HTTP status): re-authorising would not help, so point at the connection instead."""
+    if exc.status is None:
+        return (f"{name} could not be reached: check the network connection and the proxy settings "
+                f"(HTTPS_PROXY), then retry (`{probe}` shows details).")
+    return f"{name} answered HTTP {exc.status} to the login: retry later (`{probe}` shows details)."
+
+
 def _versions() -> dict[str, str]:
     out = {"eta_automations": __version__, "python": platform.python_version()}
     for dist in ("httpx", "pandas", "python-dotenv"):
@@ -445,19 +455,23 @@ class _Run:
         raise AssertionError("unreachable")  # pragma: no cover
 
     async def _authenticate(self) -> str | None:
-        """Step 6: QBO and VShip tokens now (carriers authenticate lazily); a failure names the fix."""
-        checks: tuple[tuple[str, Any, str], ...] = (
+        """Step 6: QBO and VShip tokens now (carriers authenticate lazily); a failure names the fix — the
+        credentials/command for a rejected login, the network for a service that could not be reached."""
+        checks: tuple[tuple[str, Any, str, str], ...] = (
             ("QuickBooks", self.qbo.auth,
              "Run `eta qbo-auth` to connect QuickBooks again, or check QB_CLIENT_ID / QB_CLIENT_SECRET / "
-             "QB_REALM_ID / QB_REFRESH_TOKEN in .env (`eta probe qbo` shows details)."),
+             "QB_REALM_ID / QB_REFRESH_TOKEN in .env (`eta probe qbo` shows details).", "eta probe qbo"),
             ("VShip", self.vship.auth,
-             "Check VSHIP_USER_NAME / VSHIP_PASSWORD in .env (`eta probe vship` shows details)."),
+             "Check VSHIP_USER_NAME / VSHIP_PASSWORD in .env (`eta probe vship` shows details).", "eta probe vship"),
         )
-        for name, auth, hint in checks:
+        for name, auth, hint, probe in checks:
             try:
                 await auth.get_token()
-            except (AuthError, ConfigError, ServiceError) as exc:
+            except (AuthError, ConfigError) as exc:
                 return f"{name} authentication failed: {exc}\n{hint}"
+            except ServiceError as exc:
+                advice = hint if exc.status in _CREDENTIAL_STATUSES else _service_hint(name, exc, probe)
+                return f"{name} authentication failed: {exc}\n{advice}"
         return None
 
     async def _with_services(self, services: Services) -> RunSummary:
