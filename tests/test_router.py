@@ -97,7 +97,11 @@ class FakeAggregator:
         self.probes: list[tuple[Carrier | None, str | None]] = []
         self.prepare_error: Exception | None = None
         self.closed = 0
+        self.read_only = False
         self._views: dict[Carrier, AggregatorCarrierView] = {}
+
+    def set_read_only(self) -> None:
+        self.read_only = True
 
     def view(self, carrier: Carrier) -> AggregatorCarrierView:
         view = self._views.get(carrier)
@@ -905,6 +909,11 @@ async def test_build_router_passes_settings_clock_and_http_to_each_factory(
         assert str(info.value) == "CMA lookups are disabled (ETA_PROVIDER_CMA=off)"
         await router.aclose()
         assert built["maersk"].closed == 1 and built["aggregator"].closed == 1
+        assert built["aggregator"].read_only is False
+        # CRA-01: a dry run switches the aggregator to read-only (no registration, no state-file write)
+        router = build_router(settings, token_store, clock=fixed_clock, http=http, read_only=True)
+        assert built["aggregator"].read_only is True
+        await router.aclose()
 
 
 async def test_build_router_aggregator_selected_but_not_configured(make_settings: Callable[..., Settings],

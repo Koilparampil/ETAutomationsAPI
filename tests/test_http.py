@@ -286,6 +286,27 @@ async def test_service_error_has_redacted_excerpt_request_id_and_redacted_path()
     assert "RT-SECRET-1" not in text
 
 
+async def test_huge_hostile_error_body_is_redacted_within_a_second(http_sleeps: list[float]) -> None:
+    """FND-02: one 1 MB error body shaped against the redaction patterns used to stall the event loop for hours;
+    the body is redacted from a bounded prefix and the patterns are linear."""
+    with respx.mock() as router:
+        router.post(URL).mock(return_value=httpx.Response(500, text="authorization:" + " " * 1_000_000))
+        async with httpx.AsyncClient() as client:
+            started = time.perf_counter()
+            with pytest.raises(ServiceError) as info:
+                await request(client, "POST", URL, service="svc")
+            elapsed = time.perf_counter() - started
+    assert elapsed < 1.0
+    assert info.value.status == 500 and len(info.value.body_excerpt) <= 500
+
+
+def test_json_body_with_a_huge_hostile_body_is_quick() -> None:
+    started = time.perf_counter()
+    with pytest.raises(ServiceError) as info:
+        json_body(httpx.Response(200, text="Note:" + " " * 1_000_000), service="svc")
+    assert time.perf_counter() - started < 1.0 and len(info.value.body_excerpt) <= 500
+
+
 @pytest.mark.parametrize("present,expected", [
     ({"request-id": "a", "x-azure-ref": "b"}, "b"),
     ({"x-kong-request-id": "k", "request-id": "a"}, "k"),

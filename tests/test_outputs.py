@@ -241,6 +241,24 @@ def test_write_report_csv_and_json(output_dir: Path) -> None:
     assert sorted(p.name for p in (output_dir / "reports").iterdir()) == [csv_path.name, json_path.name]
 
 
+def test_write_report_writes_each_file_on_its_own(output_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """XCT-04: a CSV that cannot be written does not stop the JSON (written first); the error is raised afterwards."""
+    from eta_automations import outputs
+    real_replace = outputs.os.replace
+
+    def replace(src: str, dst: str) -> None:
+        if str(dst).endswith(".csv"):
+            raise OSError(28, "No space left on device")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(outputs.os, "replace", replace)
+    with pytest.raises(OSError, match="No space left"):
+        write_report(output_dir, "20261105_093000", [{"doc_number": "EBKG1"}], {"report_stage": "final"})
+    csv_path, json_path = report_paths(output_dir, "20261105_093000")
+    assert json.loads(json_path.read_text(encoding="utf-8"))["report_stage"] == "final" and not csv_path.exists()
+    assert [p.name for p in (output_dir / "reports").iterdir()] == [json_path.name]     # no temporary file left
+
+
 def test_report_columns_are_the_spec_list() -> None:
     assert REPORT_COLUMNS == (
         "line_no", "doc_number", "amount", "kind", "base_booking", "carrier", "eta", "eta_source", "eta_is_actual",

@@ -185,7 +185,12 @@ def write_report(output_dir: Path, run_id: str, rows: Sequence[Mapping[str, Any]
                  meta: Mapping[str, Any]) -> tuple[Path, Path]:
     """Write (or rewrite) the run report: `reports/run_<run_id>.csv` with REPORT_COLUMNS (UTF-8 with BOM,
     one row per input row) and `reports/run_<run_id>.json` with `meta` (run_id, settings summary without
-    secrets, phase timings, versions, …) plus the same rows. Returns (csv_path, json_path)."""
+    secrets, phase timings, versions, …) plus the same rows. Returns (csv_path, json_path) of the files written.
+
+    Each file is written on its own, JSON first, so one that cannot be replaced does not stop the other. A CSV
+    that cannot be replaced because it is open (Excel on Windows locks it: PermissionError) is written as
+    `reports/run_<run_id>_<report_stage>.csv` instead, and that path is returned. Raises the first OSError when a
+    file could not be written at all."""
     csv_path, json_path = report_paths(output_dir, run_id)
     lines: list[list[str]] = [list(REPORT_COLUMNS)]
     lines.extend([_csv_cell(row.get(column)) for column in REPORT_COLUMNS] for row in rows)
@@ -197,9 +202,28 @@ def write_report(output_dir: Path, run_id: str, rows: Sequence[Mapping[str, Any]
             return len(text)
 
     csv.writer(_Sink()).writerows(lines)
-    _atomic_write_text(csv_path, UTF8_BOM + "".join(buffer), encoding="utf-8", newline="")
+    csv_text = UTF8_BOM + "".join(buffer)
     document = {**dict(meta), "rows": [dict(row) for row in rows]}
-    _atomic_write_text(json_path, json.dumps(document, indent=2, ensure_ascii=False, default=_json_default) + "\n",
-                       encoding="utf-8")
+    errors: list[OSError] = []
+    try:
+        _atomic_write_text(json_path, json.dumps(document, indent=2, ensure_ascii=False, default=_json_default) + "\n",
+                           encoding="utf-8")
+    except OSError as exc:
+        errors.append(exc)
+    try:
+        _atomic_write_text(csv_path, csv_text, encoding="utf-8", newline="")
+    except PermissionError as exc:
+        locked = csv_path
+        csv_path = locked.with_name(f"{locked.stem}_{meta.get('report_stage') or 'final'}.csv")
+        log.warning("Cannot replace the run report %s (%s) — is it open in Excel? Writing %s instead.", locked, exc,
+                    csv_path)
+        try:
+            _atomic_write_text(csv_path, csv_text, encoding="utf-8", newline="")
+        except OSError as again:
+            errors.append(again)
+    except OSError as exc:
+        errors.append(exc)
+    if errors:
+        raise errors[0]
     log.debug("Run report written: %s, %s", csv_path, json_path)
     return csv_path, json_path

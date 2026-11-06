@@ -39,7 +39,7 @@ import httpx
 
 from ..auth import request_with_auth
 from ..clock import Clock, SystemClock
-from ..config import EmailSettings
+from ..config import EmailSettings, QboSettings
 from ..errors import (
     AuthError,
     ConfigError,
@@ -79,6 +79,7 @@ __all__ = [
     "manual_restore_instructions",
     "pdf_file_name",
     "record_verification",
+    "redirect_refusal",
     "render_body",
     "validate_send",
 ]
@@ -363,6 +364,34 @@ def _send_never_reached(exc: BaseException) -> bool:
     return False
 
 
+def _outcome_unknown(exc: InvoiceSendError) -> InvoiceSendError:
+    """Mark a failed send whose request may have reached the provider (04b §7): the e-mail may have gone out, so the
+    pipeline records it as possibly e-mailed and the same-day guard blocks a resend until --force."""
+    exc.outcome_unknown = True
+    return exc
+
+
+def _swap_redirect(settings: QboSettings, inv: InvoiceSnapshot) -> tuple[str | None, str | None]:
+    """The 04b §3 redirect rule of a template_swap send: (sendTo, refusal). QBO's `sendTo` overwrites the invoice's
+    customer e-mail, so a redirect is allowed only on the sandbox or when BillEmail already is the redirect."""
+    redirect = (settings.email_redirect_to or "").strip()
+    if not redirect:
+        return None, None
+    if settings.sandbox or {r.lower() for r in inv.recipients} == {redirect.lower()}:
+        return redirect, None
+    return None, REDIRECT_NOT_ALLOWED
+
+
+def redirect_refusal(settings: QboSettings, inv: InvoiceSnapshot) -> str | None:
+    """Review fix QBO-03 — the 04b §3 redirect rule as a pure check: why a send of this invoice would be refused
+    because of QB_EMAIL_REDIRECT_TO, else None (no redirect, graph/smtp, the sandbox, or a BillEmail that already is
+    the redirect address). The pipeline applies it while planning (10 §4 guards), so such a row fails before its
+    DocNumber is suffixed (04 §6.6); TemplateSwapEmailer.send() applies the same rule in its step 1."""
+    if settings.email_strategy != "template_swap":
+        return None
+    return _swap_redirect(settings, inv)[1]
+
+
 def pdf_file_name(doc_number: str) -> str:
     """04b §6.3 step 2: Invoice_<DocNumber with unsafe characters replaced by _>.pdf"""
     return f"Invoice_{re.sub(r'[^A-Za-z0-9._-]+', '_', doc_number)}.pdf"
@@ -645,12 +674,10 @@ class TemplateSwapEmailer:
     # ── send (04b §6.2) ──
     def _redirect_target(self, inv: InvoiceSnapshot) -> str | None:
         """04b §3 redirect rule for template_swap (QBO's sendTo overwrites the customer's e-mail)."""
-        redirect = (self._s.email_redirect_to or "").strip()
-        if not redirect:
-            return None
-        if self._s.sandbox or {r.lower() for r in inv.recipients} == {redirect.lower()}:
-            return redirect
-        raise EmailPathUnavailableError(REDIRECT_NOT_ALLOWED)
+        send_to, refusal = _swap_redirect(self._s, inv)
+        if refusal:
+            raise EmailPathUnavailableError(refusal)
+        return send_to
 
     def _check_template_unchanged(self) -> None:
         """Step 3.1: adopt a subject a person changed during the run; refuse if it looks like ours."""
@@ -705,11 +732,21 @@ class TemplateSwapEmailer:
         raise TemplateRestoreError(self._broken) from last_exc
 
     async def _shielded_restore(self) -> None:
-        """Run _restore() so that a cancellation (Ctrl+C) of the caller cannot interrupt it."""
+        """Run _restore() so that a cancellation (Ctrl+C) of the caller cannot interrupt it.
+
+        A cancelled caller still waits for the restore to end before the cancellation goes on (review fix QBO-07):
+        send() holds the template lock around this call, and a queued send must not take the lock while the swapped
+        subject is still in place (04b §6.2 step 3)."""
         task = asyncio.ensure_future(self._restore())
         self._restore_task = task
         task.add_done_callback(_retrieve_exception)
-        await asyncio.shield(task)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.shield(task)
+            raise
 
     async def _after_failed_swap(self, exc: BaseException) -> None:
         """Step 3.3 failure: delete the recovery file if the template is unchanged, else restore it."""
@@ -750,6 +787,7 @@ class TemplateSwapEmailer:
             started = self._clock.now()                                                     # 3.4
             send_exc: BaseException | None = None
             response: dict[str, Any] | None = None
+            restore_failure: TemplateRestoreError | None = None
             try:
                 response = await self._qbo._post_send(inv.id, send_to)
             except BaseException as exc:  # incl. cancellation: restore first, re-raise afterwards
@@ -764,12 +802,38 @@ class TemplateSwapEmailer:
                         "failed.)")
                     error.receipt = self._receipt(inv, subject, send_to, response)  # type: ignore[attr-defined]
                     raise error from restore_exc.__cause__
-                raise TemplateRestoreError(str(restore_exc)) from send_exc
+                if not isinstance(send_exc, Exception):
+                    # QBO-07: a cancellation stays a cancellation; the failed restore is already recorded in _broken
+                    # (every later send is refused with the instructions) and logged.
+                    raise send_exc   # the cancellation itself; the restore failure stays as its __context__
+                restore_failure = restore_exc
             if send_exc is not None and not isinstance(send_exc, Exception):
                 raise send_exc                                                              # cancelled
         if send_exc is not None:                                                            # step 4
+            if restore_failure is not None:
+                raise await self._restore_failed_after_failed_send(
+                    inv, subject, send_to, started, send_exc, restore_failure) from send_exc
             return await self._infer_outcome(inv, subject, send_to, started, send_exc)
         return self._receipt(inv, subject, send_to, response)                               # step 5
+
+    async def _restore_failed_after_failed_send(self, inv: InvoiceSnapshot, subject: str, send_to: str | None,
+                                                started: datetime, send_exc: Exception,
+                                                restore_exc: TemplateRestoreError) -> TemplateRestoreError:
+        """Review fix QBO-02: the /send failed and the restore failed too. The read-only step-4 inference still runs,
+        so a delivery QuickBooks shows is reported as sent — with its receipt, like a restore failure after a
+        successful send — instead of 'No Email Sent' (which would revert the suffix and invite a second e-mail).
+        Otherwise the error says what the inference found ('not sent' or 'outcome unknown')."""
+        try:
+            receipt = await self._infer_outcome(inv, subject, send_to, started, send_exc)
+        except InvoiceSendError as inferred:
+            error = TemplateRestoreError(f"{restore_exc} (Invoice #{inv.doc_number}: {inferred.message})")
+            error.outcome_unknown = inferred.outcome_unknown
+            return error
+        error = TemplateRestoreError(
+            f"{restore_exc} (The invoice e-mail for #{inv.doc_number} WAS sent before the restore failed: the send "
+            "answer was lost, but QuickBooks shows the delivery.)")
+        error.receipt = receipt  # type: ignore[attr-defined]
+        return error
 
     async def _infer_outcome(self, inv: InvoiceSnapshot, subject: str, send_to: str | None,
                              started: datetime, send_exc: BaseException) -> SendReceipt:
@@ -795,11 +859,13 @@ class TemplateSwapEmailer:
             raise InvoiceSendError(QBO_SERVICE, f"invoice e-mail not sent: {send_exc}. QuickBooks shows no "
                                                 "delivery — safe to retry later.") from send_exc
         if not checked:
-            raise InvoiceSendError(QBO_SERVICE, f"invoice e-mail outcome unknown ({send_exc}); QuickBooks could not "
-                                                "be checked — check the invoice before re-sending.") from send_exc
+            raise _outcome_unknown(InvoiceSendError(
+                QBO_SERVICE, f"invoice e-mail outcome unknown ({send_exc}); QuickBooks could not be checked — check "
+                             "the invoice before re-sending.")) from send_exc
         # timeouts / 5xx / unreadable answers: the request may have reached Intuit (04b §6.2 step 4)
-        raise InvoiceSendError(QBO_SERVICE, f"invoice e-mail outcome unknown ({send_exc}); QuickBooks shows no "
-                                            "delivery yet — check the invoice before re-sending.") from send_exc
+        raise _outcome_unknown(InvoiceSendError(
+            QBO_SERVICE, f"invoice e-mail outcome unknown ({send_exc}); QuickBooks shows no delivery yet — check the "
+                         "invoice before re-sending.")) from send_exc
 
     def _receipt(self, inv: InvoiceSnapshot, subject: str, send_to: str | None,
                  response: Mapping[str, Any] | None) -> SendReceipt:
@@ -1009,8 +1075,9 @@ class GraphTransport:
             if (exc.status is not None and (400 <= exc.status < 500 or exc.status == 503)) or (
                     exc.status is None and isinstance(exc.__cause__, _NEVER_REACHED_CAUSES)):
                 raise InvoiceSendError("graph", f"e-mail not sent: {exc}", request_id=exc.request_id) from exc
-            raise InvoiceSendError(f"e-mail outcome unknown — check the Sent Items of {mail.sender} before re-sending",
-                                   request_id=exc.request_id) from exc
+            raise _outcome_unknown(InvoiceSendError(
+                f"e-mail outcome unknown — check the Sent Items of {mail.sender} before re-sending",
+                request_id=exc.request_id)) from exc
         return None  # sendMail returns 202 with an empty body: no message id
 
     async def aclose(self) -> None:
@@ -1115,8 +1182,8 @@ class SmtpTransport:
                 raise InvoiceSendError("smtp", f"e-mail not sent (rejected by the server): "
                                                f"{redact(repr(exc))}") from exc
             except (OSError, smtplib.SMTPException) as exc:   # e.g. timeout / disconnect during DATA
-                raise InvoiceSendError(f"e-mail outcome unknown — check the Sent Items of {mail.sender} before "
-                                       "re-sending") from exc
+                raise _outcome_unknown(InvoiceSendError(
+                    f"e-mail outcome unknown — check the Sent Items of {mail.sender} before re-sending")) from exc
         finally:
             _quit_quietly(conn)
         if refused:

@@ -18,8 +18,16 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
-from fakes import DEFAULT_EMAIL, Booking, FakeMscCarrier, FakeWorld, fake_build_services
+from fakes import (
+    DEFAULT_EMAIL,
+    WRITE_METHODS,
+    Booking,
+    FakeMscCarrier,
+    FakeWorld,
+    fake_build_services,
+)
 
 from eta_automations import pipeline
 from eta_automations.carriers.msc import NO_TOKEN_MESSAGE
@@ -36,6 +44,7 @@ from eta_automations.errors import (
     InvoiceSendError,
     InvoiceUpdateError,
     NoEtaError,
+    NoteError,
     ServiceError,
     TemplateRestoreError,
 )
@@ -44,7 +53,12 @@ from eta_automations.models import Carrier, OutputFile, Plan, Route
 from eta_automations.outputs import REPORT_COLUMNS, UTF8_BOM
 from eta_automations.pipeline import RunSummary, read_input, run
 from eta_automations.qbo.client import QboClient
-from eta_automations.qbo.email import SendReceipt, manual_restore_instructions
+from eta_automations.qbo.email import (
+    RECOVERY_FILE_NAME,
+    REDIRECT_NOT_ALLOWED,
+    SendReceipt,
+    manual_restore_instructions,
+)
 from eta_automations.run_lock import run_lock
 from eta_automations.vship.client import VShipClient
 
@@ -656,6 +670,59 @@ async def test_p35_no_email(world: FakeWorld, run_pipeline: Runner) -> None:
     assert res.summary.ok == 1 and res.summary.exit_code == 0
 
 
+GRAPH_ENV = {"QB_EMAIL_STRATEGY": "graph", "EMAIL_FROM": "accounting@example.com", "EMAIL_GRAPH_TENANT_ID": "t",
+             "EMAIL_GRAPH_CLIENT_ID": "c", "EMAIL_GRAPH_CLIENT_SECRET": "s"}
+
+
+@pytest.mark.parametrize(("case", "env", "no_email"), [
+    ("--no-email", {}, True),
+    ("no e-mail rows", {}, False),
+    ("graph sends", GRAPH_ENV, False),
+])
+async def test_a_template_left_swapped_by_a_crashed_run_is_repaired_by_every_real_run(
+        world: FakeWorld, run_pipeline: Runner, state_dir: Path, case: str, env: dict[str, str],
+        no_email: bool) -> None:
+    """XCT-03 (10 Phase 3 step 2, 04b §6.2 step 1): the repair happens before the prompt also when this run sends
+    nothing through template_swap, whose preflight would otherwise be the only one to look at the recovery file."""
+    (state_dir / RECOVERY_FILE_NAME).write_text("{}", encoding="utf-8")
+    rows = SCENARIOS["P4"](world) if case == "no e-mail rows" else SCENARIOS["P1"](world)
+    res = await run_pipeline(rows, env=env, no_email=no_email)
+    assert world.calls.named("qbo.recover_email_template") == [("qbo.recover_email_template",)]
+    first_write = next(i for i, c in enumerate(world.calls) if c[0] in WRITE_METHODS)
+    assert world.calls.index(("qbo.recover_email_template",)) < first_write       # before the prompt and any write
+    assert res.summary.exit_code == 0
+
+
+async def test_template_swap_sends_leave_the_repair_to_their_preflight(world: FakeWorld, run_pipeline: Runner,
+                                                                       state_dir: Path) -> None:
+    (state_dir / RECOVERY_FILE_NAME).write_text("{}", encoding="utf-8")
+    await run_pipeline(SCENARIOS["P1"](world))
+    assert world.calls.named("qbo.recover_email_template") == []
+    assert world.calls.named("qbo.prepare_for_sending") == [("qbo.prepare_for_sending", False)]
+
+
+async def test_no_recovery_file_means_no_repair_and_a_dry_run_only_warns(world: FakeWorld, run_pipeline: Runner,
+                                                                         state_dir: Path) -> None:
+    await run_pipeline(SCENARIOS["P4"](world))
+    assert world.calls.named("qbo.recover_email_template") == []
+    (state_dir / RECOVERY_FILE_NAME).write_text("{}", encoding="utf-8")
+    world.calls.clear()
+    world.qbo.write_attempts.clear()
+    dry = await run_pipeline(SCENARIOS["P4"](world), dry_run=True)
+    assert world.calls.named("qbo.recover_email_template") == [] and world.qbo.write_attempts == []
+    assert "may still be modified by a crashed run" in dry.out
+
+
+async def test_a_failed_template_repair_is_reported_prominently(world: FakeWorld, run_pipeline: Runner,
+                                                                state_dir: Path) -> None:
+    (state_dir / RECOVERY_FILE_NAME).write_text("{}", encoding="utf-8")
+    world.qbo.recover_error = TemplateRestoreError(RESTORE_MSG)
+    res = await run_pipeline(SCENARIOS["P4"](world))
+    assert res.out.count(RESTORE_MSG) >= 2                 # before the prompt, and again with the final summary
+    assert res.summary.exit_code == 4
+    assert res.plan("EBKG10000004").status == "OK"         # the ETA updates are not affected
+
+
 async def test_p36_ambiguous_doc_number_d21(world: FakeWorld, run_pipeline: Runner) -> None:
     b = world.add("EBKG10000036", eta=ARRIVED, invoice=None)
     world.qbo.ambiguous["EBKG10000036"] = ("101", "102")
@@ -672,6 +739,43 @@ async def test_p37_router_memo_one_carrier_call_per_booking(world: FakeWorld, ru
     res = await run_pipeline([a, b])
     assert world.carriers[Carrier.CMA].get_eta_calls == ["NAM1000037"]
     assert res.plan("NAM1000037").eta is not None and res.plan("NAM1000037 A").eta is not None
+
+
+async def test_two_rows_of_one_booking_after_a_first_notice_send_one_second_notice(world: FakeWorld,
+                                                                                    run_pipeline: Runner) -> None:
+    """XCT-01: 'X' and 'X A' (two open invoices of one booking, a normal input pair) are both decided from one read of
+    the VShip notes. The original handled rows one at a time and re-read the notes, so its second row saw the first
+    row's new note: here NOTIF #2 → Ben, not a second e-mail and a second note."""
+    a = world.add("EBKG10000050", eta=ARRIVED, comments=NOTIF1_OLD)
+    b = world.add("EBKG10000050 A", eta=ARRIVED, comments=NOTIF1_OLD)       # the same VShip booking
+    res = await run_pipeline([a, b])
+    assert world.calls.named("qbo.send_invoice") == [send("EBKG10000050 A", subject("EBKG10000050", ARRIVED_SECOND))]
+    assert world.calls.named("vship.post_comment") == [note(b.vship_id, "ARRIVED ON 11/03. NOTIF #2")]
+    assert res.plan("EBKG10000050").route is Route.NOTIFY and res.plan("EBKG10000050").status == "OK"
+    assert res.plan("EBKG10000050 A").route is Route.BEN and res.text(OutputFile.BEN) == "EBKG10000050 A\n"
+    assert world.row_writes(Booking("", "", None, None, None, b.invoice_id, None)) == []   # 'X A' untouched
+
+
+async def test_two_rows_of_one_booking_without_notes_send_one_first_notice(world: FakeWorld,
+                                                                           run_pipeline: Runner) -> None:
+    a = world.add("EBKG10000050", eta=ARRIVED)
+    b = world.add("EBKG10000050 A", eta=ARRIVED)
+    res = await run_pipeline([a, b])
+    assert world.calls.named("qbo.send_invoice") == [send("EBKG10000050 A", subject("EBKG10000050", ARRIVED_FIRST))]
+    assert world.calls.named("vship.post_comment") == [note(b.vship_id, "ARRIVED ON 11/03. NOTIF #1")]
+    assert res.plan("EBKG10000050 A").status == "FAILED"
+    assert res.failed_text == "[SKIP] #EBKG10000050 A - Done in the last week\n"
+    assert all(c[1] != "EBKG10000050 A" for c in world.calls.named("qbo.update_invoice"))   # never renamed 'AA'
+
+
+async def test_two_rows_of_one_booking_with_future_eta_are_both_notified(world: FakeWorld,
+                                                                         run_pipeline: Runner) -> None:
+    """'ARRIVING ON mm/dd.' notes are not notices (01 §11), so the original e-mailed both rows (O4): unchanged."""
+    a = world.add("NAM1000052", eta=CMA_ETA)
+    b = world.add("NAM1000052 A", eta=CMA_ETA)
+    res = await run_pipeline([a, b])
+    assert len(world.calls.named("qbo.send_invoice")) == 2
+    assert res.plan("NAM1000052").status == "OK" and res.plan("NAM1000052 A").status == "OK"
 
 
 async def test_p38_run_lock(world: FakeWorld, run_pipeline: Runner, state_dir: Path) -> None:
@@ -948,6 +1052,37 @@ async def test_qbo_update_failure_stops_the_row(world: FakeWorld, run_pipeline: 
                                "qbo: update rejected: 6000 Business Validation Error\n\n")
 
 
+async def test_send_with_unknown_outcome_blocks_a_same_day_rerun(world: FakeWorld, run_pipeline: Runner) -> None:
+    """RUL-02 (04b §7): a send that may have reached the provider (timeout, 5xx, lost answer) is reverted (D11) and
+    reported like any failed send, but the ledger counts it as possibly e-mailed: a re-run the same day does not
+    e-mail the customer again without --force."""
+    b = world.add("EBKG10000001", eta=ARRIVED)
+    assert b.invoice_id is not None
+    unknown = InvoiceSendError("qbo", "invoice e-mail outcome unknown (ReadTimeout); QuickBooks shows no delivery "
+                                      "yet — check the invoice before re-sending.")
+    unknown.outcome_unknown = True
+    world.qbo.send_errors[b.invoice_id] = unknown
+    first = await run_pipeline([b])
+    assert world.writes() == [upd("EBKG10000001", date(2026, 11, 3), "EBKG10000001 A"),
+                              send("EBKG10000001 A", SUBJECT_P1),
+                              upd("EBKG10000001 A", None, "EBKG10000001")]            # D11 revert kept
+    assert first.failed_text == (
+        "[ERROR] #EBKG10000001 - QB Invoice Processing Error, No Email Sent\n"
+        f"{unknown} (invoice number reverted to EBKG10000001)\n\n")
+    emailed = [r for r in first.ledger() if r["action"] == "emailed"]
+    assert len(emailed) == 1 and emailed[0]["ok"] is False and emailed[0]["detail"]["outcome_unknown"] is True
+    world.qbo.send_errors.clear()
+    world.calls.clear()
+    (first.settings.run.output_dir / OutputFile.FAILED.value).unlink()
+    second = await run_pipeline([b])
+    assert world.calls.named("qbo.send_invoice") == [] and world.writes() == []
+    assert second.plan("EBKG10000001").status == "FAILED"
+    assert second.failed_text == ("[SKIP] #EBKG10000001 - already e-mailed today at 09:30 (ledger); "
+                                  "use --force to resend\n")
+    forced = await run_pipeline([b], force=True)                         # --force overrides, as for any e-mail
+    assert forced.plan("EBKG10000001").status == "OK" and len(world.calls.named("qbo.send_invoice")) == 1
+
+
 async def test_failed_revert_is_reported_d11(world: FakeWorld, run_pipeline: Runner) -> None:
     b = world.add("EBKG10000065", eta=ARRIVED)
     assert b.invoice_id is not None
@@ -960,7 +1095,22 @@ async def test_failed_revert_is_reported_d11(world: FakeWorld, run_pipeline: Run
     assert [(r["action"], r["ok"]) for r in res.ledger()][-1] == ("qbo_revert_doc_number", False)
 
 
-async def test_restore_error_after_a_successful_send_keeps_the_suffix(world: FakeWorld, run_pipeline: Runner) -> None:
+async def next_day_run(settings: Settings, tmp_path: Path, doc: str,
+                       comments: Iterable[Mapping[str, Any]]) -> tuple[FakeWorld, RunSummary]:
+    """The next morning's run (2026-11-06 09:30) on what QuickBooks and VShip show after a run on 2026-11-05."""
+    day2 = FixedClock(datetime(2026, 11, 6, 9, 30))
+    world2 = FakeWorld(day2)
+    row = world2.add(doc, eta=ARRIVED, comments=comments)
+    summary = await run(settings, write_input(tmp_path, [row], "day2.csv"), assume_yes=True, clock=day2,
+                        services=world2.services(settings), out=io.StringIO())
+    return world2, summary
+
+
+async def test_restore_error_after_a_successful_send_keeps_the_suffix(world: FakeWorld, run_pipeline: Runner,
+                                                                      tmp_path: Path) -> None:
+    """RUL-03: the e-mail went out and only the template restore failed (04b §6.2 step 3.5). The send counts as done:
+    the suffix stays, the ledger records the e-mail, and the row still writes its VShip note and ETA (01 §6.4 steps
+    5-6), so the 7-day rule (01 §11) holds the next day. The other e-mails of the run are blocked (04b §6.1)."""
     b = world.add("EBKG10000066", eta=ARRIVED)
     later = world.add("EBKG10000067", eta=ARRIVED)
     assert b.invoice_id is not None
@@ -972,11 +1122,22 @@ async def test_restore_error_after_a_successful_send_keeps_the_suffix(world: Fak
     world.qbo.send_errors[b.invoice_id] = error
     res = await run_pipeline([b, later], env={"ETA_MAX_PARALLEL_BOOKINGS": "1"})
     assert world.row_writes(b) == [upd("EBKG10000066", date(2026, 11, 3), "EBKG10000066 A"),
-                                   send("EBKG10000066 A", subject("EBKG10000066", ARRIVED_FIRST))]   # no revert
+                                   send("EBKG10000066 A", subject("EBKG10000066", ARRIVED_FIRST)),   # no revert
+                                   note(b.vship_id, "ARRIVED ON 11/03. NOTIF #1"),
+                                   patch(b.vship_id, "2026-11-03T00:00:00")]
     assert world.row_writes(later) == []
     emailed = [r for r in res.ledger() if r["action"] == "emailed"]
     assert emailed and emailed[0]["ok"] is True and emailed[0]["detail"]["sent_at"] == "2026-11-05T09:31:00"
-    assert res.summary.exit_code == 4 and res.summary.failed == 2
+    plan = res.plan("EBKG10000066")
+    assert plan.status == "OK" and any("could not be restored" in w for w in plan.warnings)
+    assert "EBKG10000066 - QB Invoice Processing Error" not in (res.failed_text or "")
+    assert (res.failed_text or "").startswith("[ERROR] #EBKG10000067 - QB Invoice Processing Error, No Email Sent\n")
+    assert (res.summary.exit_code, res.summary.ok, res.summary.failed) == (4, 1, 1)
+    assert res.out.count(RESTORE_MSG) >= 2     # the banner, and again with the final summary
+    assert b.vship_id is not None
+    world2, day2 = await next_day_run(res.settings, tmp_path, "EBKG10000066 A", world.vship.comments[b.vship_id])
+    assert day2.plans[0].message == "[SKIP] #EBKG10000066 A - Done in the last week"
+    assert world2.calls.named("qbo.send_invoice") == []
 
 
 async def test_send_while_blocked_reverts_rows_already_running(world: FakeWorld, run_pipeline: Runner) -> None:
@@ -1097,6 +1258,93 @@ async def test_console_plan_summary_format(world: FakeWorld, run_pipeline: Runne
     assert "Done: 2 succeeded, 2 failed/skipped." in lines
 
 
+async def test_plan_summary_warns_that_a_shadow_run_changes_quickbooks_and_vship(world: FakeWorld,
+                                                                                 run_pipeline: Runner) -> None:
+    """CLI-01 (04b §10 step 4): QB_EMAIL_REDIRECT_TO only changes the e-mail recipients; the DocNumber suffix, the
+    VShip notes and the ledger are still written, and they record the notice as sent."""
+    rows = SCENARIOS["P1"](world)
+    res = await run_pipeline(rows, env={"QB_EMAIL_STRATEGY": "graph", "QB_EMAIL_REDIRECT_TO": "shadow@internal.example",
+                                        "EMAIL_FROM": "accounting@example.com", "EMAIL_GRAPH_TENANT_ID": "t",
+                                        "EMAIL_GRAPH_CLIENT_ID": "c", "EMAIL_GRAPH_CLIENT_SECRET": "s"},
+                             dry_run=True)
+    line = next(x for x in res.out.splitlines() if "QB_EMAIL_REDIRECT_TO is set" in x)
+    assert "shadow@internal.example" in line and "REAL" in line
+    quiet = await run_pipeline(rows, dry_run=True)                       # no redirect → no such line
+    assert "QB_EMAIL_REDIRECT_TO" not in quiet.out
+    manual = await run_pipeline(rows, env={"QB_EMAIL_REDIRECT_TO": "shadow@internal.example"}, dry_run=True,
+                                no_email=True)
+    assert "QB_EMAIL_REDIRECT_TO" not in manual.out                      # --no-email: this run sends no e-mail
+
+
+async def test_redirect_refused_by_template_swap_fails_the_row_before_any_change(world: FakeWorld,
+                                                                                 run_pipeline: Runner) -> None:
+    """QBO-03 (04 §6.6, 10 Phase 4, 04b §3): with template_swap on the production company, QB_EMAIL_REDIRECT_TO is
+    allowed only for an invoice whose BillEmail already is the redirect address. Any other NOTIFY row fails while
+    planning, before its DocNumber is suffixed — not at the send, after the QuickBooks update."""
+    customer = world.add("EBKG10000001", eta=ARRIVED)
+    internal = world.add("EBKG10000002", eta=ARRIVED, bill_email="Shadow@Example.com")
+    res = await run_pipeline([customer, internal], env={"QB_EMAIL_REDIRECT_TO": "shadow@example.com"})
+    assert res.plan("EBKG10000001").status == "FAILED"
+    assert res.failed_text == ("[ERROR] #EBKG10000001 - QB Invoice Processing Error, No Email Sent\n"
+                               f"{REDIRECT_NOT_ALLOWED}\n\n")
+    assert not any(w[1].startswith("EBKG10000001") for w in world.writes())     # no update, no send, no revert
+    assert res.plan("EBKG10000002").status == "OK"                             # the spec-allowed case still sends
+    assert send("EBKG10000002 A", subject("EBKG10000002", ARRIVED_FIRST)) in world.writes()
+
+
+async def test_redirect_refusal_does_not_apply_without_e_mails(world: FakeWorld, run_pipeline: Runner) -> None:
+    """QBO-03: --no-email sends nothing, so the redirect rule cannot fail its rows (they go to ToEmail_<run>.csv)."""
+    b = world.add("EBKG10000001", eta=ARRIVED)
+    res = await run_pipeline([b], env={"QB_EMAIL_REDIRECT_TO": "shadow@example.com"}, no_email=True)
+    plan = res.plan("EBKG10000001")
+    assert plan.status == "OK" and plan.message == "e-mail pending (manual send, --no-email)"
+    assert res.failed_text is None
+
+
+@pytest.fixture
+def report_csv_locked(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Windows/Excel: an open run_<id>.csv cannot be replaced (PermissionError, WinError 32). Returns the refused
+    destinations."""
+    from eta_automations import outputs
+    real_replace = outputs.os.replace
+    refused: list[Path] = []
+
+    def replace(src: Any, dst: Any) -> None:
+        target = Path(dst)
+        if target.name.startswith("run_") and target.suffix == ".csv" and target.stem.count("_") == 2 \
+                and target.exists():
+            refused.append(target)
+            raise PermissionError(32, "The process cannot access the file because it is being used by another "
+                                      "process", str(target))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(outputs.os, "replace", replace)
+    return refused
+
+
+async def test_declined_run_with_the_plan_report_open_in_excel_still_aborts(
+        world: FakeWorld, run_pipeline: Runner, report_csv_locked: list[Path]) -> None:
+    """XCT-04: the user opened the plan CSV while the [y/N] prompt waited, then answered N: exit 3, nothing changed,
+    no crash; the JSON report still records the abort."""
+    res = await run_pipeline(SCENARIOS["P1"](world), assume_yes=False, answer="n")
+    assert res.summary.exit_code == 3 and report_csv_locked
+    assert world.writes() == [] and res.report()["report_stage"] == "aborted"
+
+
+async def test_confirmed_run_with_the_plan_report_open_in_excel_writes_the_final_report(
+        world: FakeWorld, run_pipeline: Runner, report_csv_locked: list[Path]) -> None:
+    res = await run_pipeline(SCENARIOS["P1"](world), assume_yes=False, answer="y")
+    assert res.summary.exit_code == 0 and report_csv_locked
+    report = res.report()
+    assert report["report_stage"] == "final" and [r["status"] for r in report["rows"]] == ["OK"]
+    line = next(x for x in res.out.splitlines() if x.startswith("Report: "))
+    csv_path = Path(line.removeprefix("Report: ").split(" | ")[0])
+    assert csv_path == res.settings.run.output_dir / "reports" / f"run_{RUN_ID}_final.csv"
+    import csv
+    rows = list(csv.DictReader(csv_path.read_text(encoding="utf-8-sig").splitlines()))
+    assert [r["status"] for r in rows] == ["OK"]
+
+
 async def test_rescue_and_container_warnings_are_listed(world: FakeWorld, run_pipeline: Runner) -> None:
     b = world.add("EBKG10000068", eta=OUT_OF_WINDOW,
                   details={"rescue": True, "other_container_etas": {"MSCU2": "2026-12-03"}})
@@ -1148,6 +1396,133 @@ async def test_interruption_finishes_the_current_action_and_marks_the_rest(
         pass
 
 
+async def run_and_interrupt(world: FakeWorld, settings: Settings, tmp_path: Path, fixed_clock: FixedClock,
+                            rows: list[Booking], method: str) -> dict[str, Any]:
+    """Start a confirmed run, hold the first `method` write, press Ctrl+C (cancel the run task) while it is held,
+    then let the write finish. Returns the rewritten (interrupted) run report."""
+    entered, gate = asyncio.Event(), asyncio.Event()
+
+    async def hold(name: str, target: Any) -> None:
+        if name == method and not gate.is_set():
+            entered.set()
+            await gate.wait()
+
+    world.qbo.before_write = hold
+    world.vship.before_write = hold
+    task = asyncio.create_task(run(settings, write_input(tmp_path, rows), assume_yes=True, clock=fixed_clock,
+                                   services=world.services(settings), out=io.StringIO()))
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not task.done()                     # the running write is allowed to finish
+    gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    report: dict[str, Any] = json.loads(
+        (settings.run.output_dir / "reports" / f"run_{RUN_ID}.json").read_text(encoding="utf-8"))
+    assert report["report_stage"] == "interrupted"
+    return report
+
+
+async def test_interruption_after_the_suffix_reverts_the_doc_number(
+        world: FakeWorld, make_settings: Callable[..., Settings], tmp_path: Path, fixed_clock: FixedClock,
+        state_dir: Path) -> None:
+    """RUL-01: Ctrl+C while a NOTIFY row's suffixing QBO update runs. A notice is recorded twice — the `A` suffix and
+    the VShip NOTIF note (01 §1) — so a suffix without an e-mail would make the next run send the first notice again
+    under 'X AA' and lose the second one. The update finishes, then the D11 revert puts the number back."""
+    b = world.add("EBKG10000001", "2450.00", eta=ARRIVED)
+    settings = make_settings()
+    report = await run_and_interrupt(world, settings, tmp_path, fixed_clock, [b], "qbo.update_invoice")
+    assert world.writes() == [upd("EBKG10000001", date(2026, 11, 3), "EBKG10000001 A"),
+                              upd("EBKG10000001 A", None, "EBKG10000001")]
+    row = report["rows"][0]
+    assert row["status"] == "INTERRUPTED"
+    assert row["message"] == ("interrupted after: QBO update ETA=2026-11-03, DocNumber -> EBKG10000001 A; "
+                              "DocNumber reverted to EBKG10000001")
+    ledger = [json.loads(x) for x in (state_dir / LEDGER_FILE_NAME).read_text(encoding="utf-8").splitlines()]
+    assert [(r["action"], r["ok"]) for r in ledger] == [("qbo_update", True), ("qbo_revert_doc_number", True)]
+    assert not (settings.run.output_dir / OutputFile.FAILED.value).exists()     # nothing left to repair
+
+
+async def test_interruption_after_the_suffix_with_a_failed_revert_is_reported(
+        world: FakeWorld, make_settings: Callable[..., Settings], tmp_path: Path, fixed_clock: FixedClock) -> None:
+    b = world.add("EBKG10000001", "2450.00", eta=ARRIVED)
+    assert b.invoice_id is not None
+    world.qbo.revert_errors[b.invoice_id] = InvoiceUpdateError("qbo", "stale object twice")
+    settings = make_settings()
+    report = await run_and_interrupt(world, settings, tmp_path, fixed_clock, [b], "qbo.update_invoice")
+    assert report["rows"][0]["status"] == "FAILED"
+    assert (settings.run.output_dir / OutputFile.FAILED.value).read_text(encoding="utf-8") == (
+        "[ERROR] #EBKG10000001 - QB Invoice Processing Error, No Email Sent\n"
+        "interrupted (Ctrl+C) before the e-mail was sent (could not revert invoice number: qbo: stale object "
+        "twice)\n\n")
+
+
+async def test_interruption_during_the_send_still_writes_the_vship_note(
+        world: FakeWorld, make_settings: Callable[..., Settings], tmp_path: Path, fixed_clock: FixedClock) -> None:
+    """RUL-01: Ctrl+C while a NOTIFY row's e-mail is being sent. The e-mail goes out, so the VShip NOTIF note — the
+    record the 7-day rule reads (01 §11) — is written before the plan stops; the next day the row is
+    'Done in the last week' instead of a second first notice."""
+    b = world.add("EBKG10000001", "2450.00", eta=ARRIVED)
+    assert b.vship_id is not None
+    settings = make_settings()
+    report = await run_and_interrupt(world, settings, tmp_path, fixed_clock, [b], "qbo.send_invoice")
+    assert world.writes() == [upd("EBKG10000001", date(2026, 11, 3), "EBKG10000001 A"),
+                              send("EBKG10000001 A", SUBJECT_P1),
+                              note(b.vship_id, "ARRIVED ON 11/03. NOTIF #1")]       # no ETA patch after Ctrl+C
+    row = report["rows"][0]
+    assert row["status"] == "INTERRUPTED"
+    assert row["message"].endswith("QBO e-mail; VShip note 'ARRIVED ON 11/03. NOTIF #1'")
+    assert not (settings.run.output_dir / OutputFile.FAILED.value).exists()
+    world2, day2 = await next_day_run(settings, tmp_path, "EBKG10000001 A", world.vship.comments[b.vship_id])
+    assert day2.plans[0].message == "[SKIP] #EBKG10000001 A - Done in the last week"
+    assert world2.calls.named("qbo.send_invoice") == []
+
+
+async def test_interruption_with_parallel_sends_writes_the_note_of_every_e_mailed_row(
+        world: FakeWorld, make_settings: Callable[..., Settings], tmp_path: Path, fixed_clock: FixedClock) -> None:
+    """Four NOTIFY rows in parallel; their sends queue behind one lock (as template_swap's do) when Ctrl+C comes.
+    Every started send finishes (Phase 4 step 3), and every row that e-mailed also gets its VShip note."""
+    rows = [world.add(f"EBKG1000008{i}", eta=ARRIVED) for i in range(1, 5)]
+    settings = make_settings({"ETA_MAX_PARALLEL_BOOKINGS": "4"})
+    entered, gate, lock = asyncio.Event(), asyncio.Event(), asyncio.Lock()
+
+    async def hold(name: str, target: Any) -> None:
+        if name == "qbo.send_invoice":
+            async with lock:
+                if not gate.is_set():
+                    entered.set()
+                    await gate.wait()
+
+    world.qbo.before_write = hold
+    task = asyncio.create_task(run(settings, write_input(tmp_path, rows), assume_yes=True, clock=fixed_clock,
+                                   services=world.services(settings), out=io.StringIO()))
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    for b in rows:
+        assert [c[0] for c in world.row_writes(b)] == ["qbo.update_invoice", "qbo.send_invoice", "vship.post_comment"]
+    assert world.calls.named("vship.patch_expected_arrival") == []
+
+
+async def test_interruption_during_the_send_with_a_failed_note_is_reported(
+        world: FakeWorld, make_settings: Callable[..., Settings], tmp_path: Path, fixed_clock: FixedClock) -> None:
+    b = world.add("EBKG10000001", "2450.00", eta=ARRIVED)
+    assert b.vship_id is not None
+    world.vship.post_errors[b.vship_id] = NoteError("vship", "comment rejected (HTTP 500)")
+    settings = make_settings()
+    report = await run_and_interrupt(world, settings, tmp_path, fixed_clock, [b], "qbo.send_invoice")
+    assert report["rows"][0]["status"] == "FAILED"
+    assert (settings.run.output_dir / OutputFile.FAILED.value).read_text(encoding="utf-8") == (
+        "[ERROR] #EBKG10000001 - Note Write Error, QB Invoice Processing Successful\n"
+        "vship: comment rejected (HTTP 500)\n\n")
+
+
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 # build_services (10 §3)
 # ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1163,6 +1538,39 @@ async def test_build_services_creates_real_clients_without_network(make_settings
         assert services.token_store.path == state_dir / "tokens.json"
     async with pipeline.build_services(settings, datetime(2026, 11, 5, 9, 30), read_only=False) as services:
         assert not services.qbo.read_only and services.outputs.enabled and services.ledger.enabled
+
+
+async def test_dry_run_never_registers_aggregator_bookings(world: FakeWorld, make_settings: Callable[..., Settings],
+                                                         tmp_path: Path, fixed_clock: FixedClock,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """CRA-01 (11 §2: a dry run writes nothing anywhere): the real build_services() builds the router read-only, so
+    the aggregator never registers a booking at ShipsGo (1 credit each) nor writes aggregator_tracking.json."""
+    import respx
+
+    def fake_qbo(settings: Settings, token_store: Any, *, read_only: bool) -> Any:
+        world.qbo.read_only = read_only
+        return world.qbo
+
+    def fake_vship(settings: Settings, token_store: Any, *, read_only: bool) -> Any:
+        world.vship.read_only = read_only
+        return world.vship
+
+    monkeypatch.setattr(pipeline, "build_qbo", fake_qbo)
+    monkeypatch.setattr(pipeline, "build_vship", fake_vship)
+    settings = make_settings({"AGG_API_TOKEN": "agg-token-123456", "ETA_PROVIDER_CMA": "aggregator"})
+    assert settings.aggregator is not None
+    base = settings.aggregator.base_url
+    with respx.mock(assert_all_called=False, assert_all_mocked=True) as api:
+        api.get(f"{base}/ocean/shipments").mock(return_value=httpx.Response(
+            200, json={"message": "SUCCESS", "shipments": [], "meta": {"more": False, "total": 0}}))
+        create = api.post(f"{base}/ocean/shipments").mock(return_value=httpx.Response(
+            200, json={"message": "SUCCESS", "shipment": {"id": 501}}))
+        summary = await run(settings, write_input(tmp_path, ["NAM1234567,5000"]), dry_run=True, clock=fixed_clock,
+                            out=io.StringIO())
+    assert summary.exit_code == 0 and create.call_count == 0
+    assert not settings.aggregator.state_file.exists()
+    assert "a real run registers it (1 credit)" in summary.plans[0].message
+    assert world.qbo.closed == 1
 
 
 async def test_run_through_monkeypatched_build_services(world: FakeWorld, make_settings: Callable[..., Settings],

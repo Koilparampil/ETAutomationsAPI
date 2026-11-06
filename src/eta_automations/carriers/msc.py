@@ -48,7 +48,7 @@ from ..logging_setup import redact
 from ..models import Carrier, EtaResult
 from ..token_store import TokenStore, is_fresh, jwt_exp
 from . import dcsa
-from .base import error_text
+from .base import TokenCache, error_text
 
 __all__ = [
     "DISCHARGE_EVENT",
@@ -131,6 +131,14 @@ SPACED_TOKEN_MESSAGE: Final = (
     "The MSC access token contains spaces or line breaks. Paste only the token itself "
     "(with or without the leading 'Bearer ')."
 )
+UNPRINTABLE_TOKEN_MESSAGE: Final = (   # review fix MSK-01: an HTTP header can carry only printable ASCII
+    "The MSC access token contains invisible or non-ASCII characters (for example a zero-width space, or '…' from "
+    "a shortened copy). Copy the whole token again from your signed-in myMSC session (06-carrier-msc §2.2)."
+)
+STORED_TOKEN_UNSENDABLE_MESSAGE: Final = (
+    "The stored MSC access token contains invisible or non-ASCII characters and cannot be sent. Paste it again "
+    "with `eta msc-token`."
+)
 RESCUE_SOURCE_MYMSC: Final = "MSC containers[0].finalEta (rescue)"   # 06 §7.5
 RESCUE_SOURCE_API: Final = "MSC API DCSA arrival (rescue)"           # 06 §7.5
 
@@ -164,7 +172,7 @@ _TYPE_CODE_KEYS: Final[Mapping[str, str]] = MappingProxyType({
 })
 _SOURCE_COLUMN_MAX = 70
 
-LatchKind = Literal["auth", "edge", "api"]
+LatchKind = Literal["auth", "edge", "api", "config"]   # "config": a setting that cannot be sent (MSK-01)
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -196,7 +204,9 @@ def parse_msc_date(value: str) -> datetime:
     """Locale-independent "%d %b %Y" (MSC-D6): "12 Nov 2026" → datetime(2026, 11, 12).
 
     The month comes from a fixed English map because strptime("%b") depends on the locale (Windows).
-    Anything else → ValueError(f"unrecognised MSC date {value!r}").
+    Anything else → ValueError(f"unrecognised MSC date {value!r}"). A year outside dcsa.PLAUSIBLE_YEARS (2000-2100,
+    e.g. the .NET sentinels 01 Jan 0001 / 31 Dec 9999) → ValueError too (review fix MSK-02, as 09 §A.3.4 step 3):
+    a matched event with such a date is then the parity NoEtaError, never a year-1 or year-9999 ETA.
     """
     text = value.strip() if isinstance(value, str) else ""
     match = _MSC_DATE_RE.match(text)
@@ -204,9 +214,20 @@ def parse_msc_date(value: str) -> datetime:
     if match is None or month is None:
         raise ValueError(f"unrecognised MSC date {value!r}")
     try:
-        return datetime(int(match.group(3)), month, int(match.group(1)))
+        parsed = datetime(int(match.group(3)), month, int(match.group(1)))
     except ValueError as exc:  # e.g. "31 Feb 2026"
         raise ValueError(f"unrecognised MSC date {value!r}") from exc
+    if not _plausible(parsed):
+        raise ValueError(f"implausible MSC date {value!r} (year outside {_YEARS_TEXT})")
+    return parsed
+
+
+def _plausible(value: datetime) -> bool:
+    """09 §A.3.4 step 3: event dates outside dcsa.PLAUSIBLE_YEARS are sentinels, not dates (review fix MSK-02)."""
+    return value.year in dcsa.PLAUSIBLE_YEARS
+
+
+_YEARS_TEXT = f"{dcsa.PLAUSIBLE_YEARS.start}-{dcsa.PLAUSIBLE_YEARS.stop - 1}"
 
 
 def parse_wall_datetime(value: str) -> datetime:
@@ -331,7 +352,8 @@ def _wrap_parse(fn: Callable[[], EtaResult], booking: str) -> EtaResult:
         return fn()
     except (CarrierLookupError, NoEtaError, CustomsHoldError):
         raise
-    except (LookupError, TypeError, AttributeError, ValueError) as exc:   # LookupError = KeyError + IndexError
+    # LookupError = KeyError + IndexError; OverflowError = date arithmetic on an absurd date (MSK-04)
+    except (LookupError, TypeError, AttributeError, ValueError, OverflowError) as exc:
         raise CarrierLookupError(f"Unexpected MSC payload shape for {booking}: {exc!r}") from exc
 
 
@@ -379,7 +401,7 @@ def _graphql_container_eta(container: Any, now: datetime) -> datetime | None:
         return None
     try:
         sel = select_eta(container.get("events") or [], now=now, name_key="eventName", date_of=_graphql_date_of)
-    except (NoEtaError, ValueError, LookupError, TypeError, AttributeError):
+    except (NoEtaError, ValueError, LookupError, TypeError, AttributeError, OverflowError):
         return None
     return sel.eta if sel is not None else None
 
@@ -396,6 +418,8 @@ def _graphql_rescue(c0: Mapping[str, Any]) -> MscSelection | None:
         try:
             eta = datetime.combine(parse_wall_datetime(raw).date(), dtime())
         except ValueError:
+            return None
+        if not _plausible(eta):                    # a sentinel finalEta is no ETA (MSK-02)
             return None
     return MscSelection(eta, "finalEta", False, False, raw.strip(), eta, None)
 
@@ -534,6 +558,9 @@ def _api_record(item: Any, index: int) -> dict[str, Any] | None:
     except ValueError:
         log.debug("[MSC API] skipped event #%d: unreadable eventDateTime %r", index, raw_when)
         return None
+    if not _plausible(when):   # .NET sentinels 0001-01-01 / 9999-12-31 (review fix MSK-02, as 09 §A.3.4 step 3)
+        log.debug("[MSC API] skipped event #%d: eventDateTime year %d outside %s", index, when.year, _YEARS_TEXT)
+        return None
     tc = _ci_child(m, "transportcall")
     unloc = ""
     for candidate in (tc.get("unlocationcode"), _ci_child(m, "eventlocation").get("unlocationcode"),
@@ -576,7 +603,7 @@ def _api_date_of(ev: Mapping[str, Any]) -> datetime:
 def _api_container_eta(records: Sequence[Mapping[str, Any]], container: str, now: datetime) -> datetime | None:
     try:
         sel = select_eta(_timeline(records, container), now=now, name_key="name", date_of=_api_date_of)
-    except (NoEtaError, ValueError):
+    except (NoEtaError, ValueError, OverflowError):   # log only: never fails the lookup (MSK-04)
         return None
     return sel.eta if sel is not None else None
 
@@ -739,7 +766,9 @@ def _report_body(resp: httpx.Response) -> Any:
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 def normalize_token(token: str) -> str:
     """06 §5.1 set_manual_token steps 1–2: strip whitespace and a leading "Bearer " (case-insensitive; a pasted
-    "Authorization:" header name is tolerated too). Empty or whitespace-containing → ConfigError (never echoes it)."""
+    "Authorization:" header name is tolerated too). Empty or whitespace-containing → ConfigError (never echoes it).
+    Invisible or non-ASCII characters (U+200B, a BOM, '…', control characters) → ConfigError too (review fix MSK-01):
+    httpx can send only ASCII header values, so such a token would fail every lookup."""
     if not isinstance(token, str):
         raise ConfigError(EMPTY_TOKEN_MESSAGE)
     value = _AUTH_PREFIX_RE.sub("", token.strip(), count=1).strip()
@@ -747,6 +776,8 @@ def normalize_token(token: str) -> str:
         raise ConfigError(EMPTY_TOKEN_MESSAGE)
     if any(ch.isspace() for ch in value):
         raise ConfigError(SPACED_TOKEN_MESSAGE)
+    if not value.isascii() or not value.isprintable():
+        raise ConfigError(UNPRINTABLE_TOKEN_MESSAGE)
     return value
 
 
@@ -799,6 +830,7 @@ class MscBridgeAuth:
                  epoch: Callable[[], float] = time.time) -> None:
         self._settings = settings
         self._store = token_store
+        self._cache = TokenCache(token_store, TOKEN_KEY, label="MSC")   # best-effort writes (MSK-05)
         self._epoch = epoch
         self._lock = asyncio.Lock()
         self._rejected = False                 # MSC_ACCESS_TOKEN was rejected (HTTP 401) in this process
@@ -811,7 +843,7 @@ class MscBridgeAuth:
             if self._fatal is not None:  # 1. latched: same message every time
                 raise AuthError(str(self._fatal)) from self._fatal
             now = self._epoch()
-            entry = self._store.get(TOKEN_KEY)
+            entry = self._cache.get()
             if entry is not None and entry.get("mode") == "mymsc" and is_fresh(entry, now=now):   # 2.
                 return str(entry["access_token"])
             env_token = self._env_token()
@@ -821,20 +853,24 @@ class MscBridgeAuth:
             raise self._fatal
 
     async def invalidate(self) -> None:
-        """Called by request_with_auth after a 401: drop the token and latch the fatal error (no re-acquisition)."""
+        """Called by request_with_auth after a 401: latch the fatal error (no re-acquisition), then drop the token.
+        The latch comes first (review fix MSK-05): a tokens.json that cannot be rewritten must not keep the rejected
+        token in use."""
         async with self._lock:
-            self._store.delete(TOKEN_KEY)
             self._rejected = True
             self._fatal = AuthError(TOKEN_REJECTED_MESSAGE)
+            self._cache.delete()
 
-    def set_manual_token(self, token: str) -> dict[str, Any]:
+    def set_manual_token(self, token: str, *, strict: bool = True) -> dict[str, Any]:
         """`eta msc-token` (06 §5.1): normalise, store with its expiry, clear the rejection; returns token_status().
 
-        Also clears a fatal error latched earlier in this process: a freshly pasted token is a new state.
+        Also clears a fatal error latched earlier in this process: a freshly pasted token is a new state. `strict`
+        (the default, `eta msc-token`) raises OSError when tokens.json cannot be written, so the command never says
+        "stored" falsely; a run's pre-flight passes strict=False and keeps the token in memory (MSK-05).
         """
         value = normalize_token(token)
         now = self._epoch()
-        entry = self._store_token(value, now=now)
+        entry = self._store_token(value, now=now, strict=strict)
         self._rejected = False
         self._fatal = None
         if entry["expires_at"] <= now:
@@ -884,14 +920,14 @@ class MscBridgeAuth:
         exp = jwt_exp(token)
         return float(exp) if exp is not None else float(now) + float(self._settings.token_ttl_seconds)
 
-    def _store_token(self, token: str, *, now: float) -> dict[str, Any]:
+    def _store_token(self, token: str, *, now: float, strict: bool = False) -> dict[str, Any]:
         entry = {"access_token": token, "expires_at": self._expires_at(token, now), "obtained_at": float(now),
                  "source": "manual", "mode": "mymsc"}
-        self._store.put(TOKEN_KEY, entry)
+        self._cache.put(entry, strict=strict)
         return entry
 
     def _current(self, now: float) -> tuple[str | None, Mapping[str, Any]]:
-        entry = self._store.get(TOKEN_KEY)
+        entry = self._cache.get()
         stored = (entry if entry is not None and entry.get("mode") == "mymsc"
                   and isinstance(entry.get("access_token"), str) and entry["access_token"] else None)
         if stored is not None and is_fresh(stored, now=now):
@@ -1013,7 +1049,7 @@ class MscClient:
         if self._auth is None:
             raise ConfigError("MSC runs in api mode (official MSC API): no bridge token is used. Use "
                               "store_manual_token() / `eta msc-token` only for the mymsc bridge or `--compare`.")
-        status = self._auth.set_manual_token(token)
+        status = self._auth.set_manual_token(token, strict=False)   # the run uses it even if it cannot be saved
         if self._fatal_kind == "auth":
             self._fatal = None
             self._fatal_kind = None
@@ -1055,6 +1091,33 @@ class MscClient:
             return await self._lookup_mymsc(booking, now, capture)
         except httpx.HTTPError as exc:  # 03 §5 safety net: request() already maps transport errors
             raise CarrierLookupError(f"MSC request failed for {booking}: {exc!r}") from exc
+        except OSError as exc:          # 03 §5 safety net (MSK-05), e.g. a local file error
+            raise CarrierLookupError(f"MSC lookup failed for {booking}: {exc!r}") from exc
+        except UnicodeError as exc:
+            # Review fix MSK-01 (03 §5): httpx encodes header values as ASCII before sending anything, so a
+            # non-ASCII setting or token fails every lookup the same way — latch it, naming the culprit.
+            culprit = self._unsendable_header()
+            if culprit is None:
+                raise CarrierLookupError(f"MSC request failed for {booking}: {exc!r}") from exc
+            self._latch(*culprit, exc)
+
+    def _unsendable_header(self) -> tuple[str, LatchKind] | None:
+        """MSK-01: the value that cannot be sent in an HTTP header (ASCII only), as (message, latch kind). The other
+        headers are constants, so in mymsc mode it is MSC_USER_EMAIL / MSC_USER_ROLES, else the bridge token."""
+        s = self._settings
+        settings: tuple[tuple[str, str | None, str], ...] = (
+            (("MSC_API_SUBSCRIPTION_KEY", s.api_key, "copy the key again into .env"),) if s.mode == "api" else (
+                ("MSC_USER_EMAIL", s.user_email,
+                 "set it in .env to your myMSC sign-in e-mail (it defaults to VSHIP_USER_NAME)"),
+                ("MSC_USER_ROLES", s.user_roles, "correct it in .env")))
+        for name, value, hint in settings:
+            if value and not value.isascii():
+                message = (f"{name} contains non-ASCII characters, which cannot be sent in an HTTP header: {hint} "
+                           "(06-carrier-msc §3.2).")
+                return message, "config"
+        if s.mode == "api":
+            return None
+        return STORED_TOKEN_UNSENDABLE_MESSAGE, "auth"
 
     def _warn_if_no_user_email(self) -> None:
         """06 §3.2: an empty MSC_USER_EMAIL omits the header; WARNING logged once."""

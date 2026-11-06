@@ -461,7 +461,7 @@ class CarrierRouter:
 # Factory (10 §3 build_services)
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 def build_router(settings: Settings, token_store: TokenStore, *, clock: Clock | None = None,
-                 http: httpx.AsyncClient | None = None) -> CarrierRouter:
+                 http: httpx.AsyncClient | None = None, read_only: bool = False) -> CarrierRouter:
     """Build every client the configured providers can use and wrap them in a CarrierRouter.
 
     Each carrier module's build_client(settings, token_store, clock=clock, http=http) (03 §9) is called for
@@ -469,7 +469,8 @@ def build_router(settings: Settings, token_store: TokenStore, *, clock: Clock | 
     uses the aggregator. A carrier routed to "aggregator" or "off" never reaches its own client (09 §D.2
     steps 4–5), so none is built for it (no unused HTTP client, no misleading start-up log line).
     `native_missing` comes from Settings.missing for the "not configured" messages; `failure_limit` from
-    ETA_CARRIER_FAILURE_LIMIT.
+    ETA_CARRIER_FAILURE_LIMIT. `read_only` (dry run) builds the aggregator so that it never registers a booking
+    (1 credit each) nor writes its tracking-state file (CRA-01).
     """
     # Imported here so that importing the router (identify_carrier) stays cheap and cycle-free.
     from . import aggregator as aggregator_module
@@ -491,6 +492,8 @@ def build_router(settings: Settings, token_store: TokenStore, *, clock: Clock | 
     aggregator = None
     if "aggregator" in providers.values():
         aggregator = aggregator_module.build_client(settings, token_store, clock=clock, http=http)
+        if read_only and aggregator is not None:
+            aggregator.set_read_only()
     native_missing = {carrier: tuple(settings.missing.get(service, ()))
                       for carrier, service in NATIVE_SERVICES.items()}
     return CarrierRouter(providers=providers, native=native, native_missing=native_missing,

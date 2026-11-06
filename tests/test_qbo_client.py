@@ -896,3 +896,65 @@ def test_snapshot_dates_are_not_timezone_shifted() -> None:
     raw = {"Id": "1", "SyncToken": "0", "DocNumber": "D", "TotalAmt": 1, "Balance": 1, "CustomField": [
         {"DefinitionId": "1000000003", "Name": "ETA", "Type": "DateType", "DateValue": "2026-11-04T23:59:59-10:00"}]}
     assert snapshot(raw).eta_value == date(2026, 11, 4)
+
+
+# ── a template left swapped by a crashed template_swap run (review fix XCT-03) ──
+ORIGINAL_SUBJECT = "Invoice [Invoice No.] from [Company Name]"
+SWAPPED_SUBJECT = ("Invoice for Booking no. EBKG12345678. ****ARRIVED ON 11/03. PLEASE PLEASE PAY AND CLEAR THE "
+                   "CARGO****")
+GRAPH_ENV = {"QB_EMAIL_STRATEGY": "graph", "EMAIL_FROM": "accounting@example.com", "EMAIL_GRAPH_TENANT_ID": "t",
+             "EMAIL_GRAPH_CLIENT_ID": "c", "EMAIL_GRAPH_CLIENT_SECRET": "s"}
+
+
+def write_recovery_file(state_dir: Any) -> Any:
+    from eta_automations.qbo.email import RECOVERY_FILE_NAME
+    path = state_dir / RECOVERY_FILE_NAME
+    path.write_text(json.dumps({"realm_id": REALM, "original_subject": ORIGINAL_SUBJECT, "original_message": None,
+                                "swapped_subject": SWAPPED_SUBJECT, "invoice_id": "190613",
+                                "written_at": "2026-11-04T16:02:11", "pid": 4242}), encoding="utf-8")
+    return path
+
+
+def mount_swapped_preferences(router: respx.MockRouter, load_fixture: Callable[[str], Any]) -> respx.Route:
+    """Preferences that still carry the swapped subject; a POST stores (and echoes) the posted subject."""
+    prefs = copy.deepcopy(load_fixture("qbo/preferences.json"))
+    prefs["Preferences"]["EmailMessagesPrefs"]["InvoiceMessage"]["Subject"] = SWAPPED_SUBJECT
+    router.get(f"{COMPANY}/preferences").mock(side_effect=lambda request: httpx.Response(200, json=prefs))
+
+    def post(request: httpx.Request) -> httpx.Response:
+        prefs["Preferences"] = json.loads(request.content)
+        return httpx.Response(200, json=prefs)
+
+    return router.post(f"{COMPANY}/preferences").mock(side_effect=post)
+
+
+@pytest.mark.parametrize("env", [{}, GRAPH_ENV], ids=["template_swap", "graph"])
+async def test_aclose_restores_a_template_left_swapped_by_a_crashed_run(make_settings, state_dir, load_fixture,
+                                                                        env: dict[str, str]) -> None:
+    """XCT-03: a run that sent nothing through template_swap (no e-mail, --no-email, graph/smtp) still repairs the
+    company-wide subject a crashed template_swap run left behind (04b §6.2; QboClient.aclose, 10 §3)."""
+    recovery = write_recovery_file(state_dir)
+    client = make_client(make_settings(env), state_dir=state_dir)
+    with respx.mock(assert_all_called=True) as router:
+        post = mount_swapped_preferences(router, load_fixture)
+        await client.aclose()
+    assert post.call_count == 1
+    assert body_of(post.calls.last)["EmailMessagesPrefs"]["InvoiceMessage"]["Subject"] == ORIGINAL_SUBJECT
+    assert not recovery.exists()
+
+
+async def test_recover_email_template_without_a_recovery_file_does_nothing(make_settings, state_dir) -> None:
+    client = make_client(make_settings(GRAPH_ENV), state_dir=state_dir)
+    with respx.mock(assert_all_mocked=True):
+        assert await client.recover_email_template() is False
+        await client.aclose()
+
+
+async def test_read_only_client_never_restores_the_template_but_warns(make_settings, state_dir, caplog) -> None:
+    caplog.set_level(logging.WARNING, logger="eta")
+    recovery = write_recovery_file(state_dir)
+    client = make_client(make_settings(GRAPH_ENV), state_dir=state_dir, read_only=True)
+    with respx.mock(assert_all_mocked=True):
+        await client.aclose()
+    assert recovery.exists()
+    assert any("may still be modified" in m for m in caplog.messages)

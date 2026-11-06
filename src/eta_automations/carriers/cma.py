@@ -50,7 +50,7 @@ from ..logging_setup import MASK, redact
 from ..models import Carrier, EtaResult
 from ..token_store import TokenStore, is_fresh, jwt_exp
 from . import dcsa
-from .base import error_text
+from .base import TokenCache, error_text
 from .dcsa import DcsaArrival, DcsaEvent
 
 __all__ = [
@@ -142,8 +142,8 @@ NO_CONTAINERS_MSG = "CMA found booking {ref} but listed no containers to read an
 class CmaTokenError(AuthError):
     """The OAuth access token could not be obtained (08 §5 token-endpoint errors).
 
-    Kept apart from the AuthError that request_with_auth() raises after a second API 401 (→ HINT_401): the
-    boundary rule (08 §6.2 step 6) wraps this one with the booking, keeping the token endpoint's own reason.
+    Kept apart from the AuthError that request_with_auth() raises after a second API 401 (→ HINT_401): _send turns
+    this one into a CarrierLookupError with the token endpoint's own reason and no booking (review fix CRA-04).
     """
 
 
@@ -200,6 +200,7 @@ class CmaOAuth:
             raise ConfigError("CMA OAuth mode needs CMA_CLIENT_ID and CMA_CLIENT_SECRET")
         self._settings = settings
         self._store = token_store
+        self._cache = TokenCache(token_store, TOKEN_STORE_KEY, label="CMA")   # best-effort writes (CRA-05)
         self._http = http
         self.wall_time = wall_time   # epoch seconds for expires_at; injectable for tests
         self._lock = asyncio.Lock()
@@ -220,7 +221,7 @@ class CmaOAuth:
     async def invalidate(self) -> None:
         """Drop the token from the store and from memory (request_with_auth calls this on a 401)."""
         self._entry = None
-        self._store.delete(TOKEN_STORE_KEY)
+        self._cache.delete()
 
     def cached_entry(self) -> dict[str, Any] | None:
         """A copy of the fresh cached entry WITHOUT access_token (probe/CLI), or None."""
@@ -234,7 +235,7 @@ class CmaOAuth:
     def secrets(self) -> tuple[str, ...]:
         """Values that must never appear in messages or probe output (client secret, access tokens)."""
         values: list[str] = [self._settings.client_secret or ""]
-        for entry in (self._entry, self._store.get(TOKEN_STORE_KEY)):
+        for entry in (self._entry, self._cache.get()):
             token = entry.get("access_token") if entry else None
             if isinstance(token, str):
                 values.append(token)
@@ -246,7 +247,7 @@ class CmaOAuth:
     # ── internals ──
     def _fresh_entry(self) -> dict[str, Any] | None:
         now = self.wall_time()
-        for entry in (self._entry, self._store.get(TOKEN_STORE_KEY)):
+        for entry in (self._entry, self._cache.get()):
             if entry is not None and is_fresh(entry, skew_seconds=OAUTH_SKEW_S, now=now):
                 self._entry = dict(entry)
                 return self._entry
@@ -292,10 +293,29 @@ class CmaOAuth:
             "token_type": token_type if isinstance(token_type, str) and token_type.strip() else "Bearer",
             "scope": scope if isinstance(scope, str) and scope.strip() else s.oauth_scope,
         }
-        self._store.put(TOKEN_STORE_KEY, entry)
-        self._entry = dict(entry)
+        self._entry = dict(entry)        # kept even if tokens.json cannot take it (CRA-05)
+        self._cache.put(entry)
         log.debug("[CMA] OAuth token obtained (expires in %d s)", int(expires_at - now))
         return token
+
+
+class _PrepaidLimiter:
+    """The proactive limiter for one logical attempt whose first slot _send already took after re-checking the gate
+    (review fix CRA-02). A further physical attempt — request_with_auth's retry after a 401 — takes its own slot, so
+    every request still counts against CMA_MAX_CALLS_PER_MINUTE."""
+
+    def __init__(self, limiter: AsyncLimiter) -> None:
+        self._limiter = limiter
+        self._prepaid = True
+
+    async def __aenter__(self) -> None:
+        if self._prepaid:
+            self._prepaid = False
+            return
+        await self._limiter.acquire()
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
 
 
 def _oauth_error_detail(exc: ServiceError) -> str:
@@ -357,6 +377,7 @@ class CmaClient:
             if settings.max_calls_per_minute else None
         )
         self._blocked_until = 0.0   # monotonic instant shared by every CMA call (08 §6.5)
+        self._gate_retry_after = 0.0   # the Retry-After of the 429 that set _blocked_until (CRA-03)
         self._memo: dict[str, asyncio.Task[EtaResult]] = {}
 
     @property
@@ -484,7 +505,7 @@ class CmaClient:
             result = evaluate_events(ref, fetched.events, endpoint=fetched.endpoint, pages=fetched.pages)
         except (CarrierLookupError, NoEtaError):
             raise
-        except (ServiceError, AuthError, httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+        except (ServiceError, AuthError, httpx.HTTPError, KeyError, TypeError, ValueError, OSError) as exc:
             raise CarrierLookupError(self._scrub_text(LOOKUP_FAILED_MSG.format(ref=ref, exc=exc))) from exc
         log.info("  [CMA] Returning ETA: %s", result.eta.strftime("%m/%d/%Y"))
         return result
@@ -543,12 +564,20 @@ class CmaClient:
             started = time.perf_counter()
             try:
                 async with self._sem:
+                    # Review fix CRA-02: a 429 may have closed the gate while this call waited for a slot or for
+                    # the limiter. Re-check right before sending; if it is closed, wait at the gate (outside the
+                    # slot) — never send inside the announced window (08 §4.6, §6.5).
+                    if self._gate_closed():
+                        continue
+                    limiter = await self._limiter_slot()
+                    if self._gate_closed():
+                        continue
                     resp = await request_with_auth(
                         self._http, "GET", url, service=SERVICE, auth=self._auth,
                         build_headers=self._build_headers,           # KeyId or Bearer
                         headers={"Accept": "application/json"},     # 08 §4.1: on every call
                         params=params, expected=(200, 404, 429), idempotent=True,
-                        max_attempts=1, limiter=self._limiter)
+                        max_attempts=1, limiter=limiter)
             except ServiceError as exc:   # 5xx, network (status None), 403, other 4xx
                 summaries.append(self._summary(url, params, exc.status, started, exc.request_id, error=exc))
                 transient = exc.status is None or exc.status in RETRY_STATUSES
@@ -560,8 +589,11 @@ class CmaClient:
                     await self._sleep(delay)
                     continue
                 raise CarrierLookupError(self._scrub_text(_service_error_message(exc, ref))) from exc
-            except CmaTokenError:
-                raise   # 08 §5: the boundary rule wraps it with the booking ("Failed to get CMA tracking info …")
+            except CmaTokenError as exc:
+                # 08 §5: keep the token endpoint's own reason. Review fix CRA-04: without the booking, so rejected
+                # OAuth credentials or an unreachable token host give one text for every booking and the circuit
+                # breaker (10 §6) stops the remaining CMA lookups instead of each row calling the token endpoint.
+                raise CarrierLookupError(self._scrub_text(str(exc))) from exc
             except AuthError as exc:   # second 401 after the token refresh (request_with_auth)
                 cause = exc.__cause__
                 status = cause.status if isinstance(cause, ServiceError) else 401
@@ -572,19 +604,44 @@ class CmaClient:
             if resp.status_code != 429:
                 return resp   # 200 or 404
             ra = _parse_retry_after(resp.headers.get("Retry-After"), default=DEFAULT_RETRY_AFTER_S)
+            # 08 §6.5: CMA's quota is per application — every concurrent CMA call waits at the shared gate. Review
+            # fix CRA-03: every 429 closes it, also one this call gives up on (over the cap, or the 4th 429), so no
+            # other CMA call is sent inside the announced window either.
+            self._close_gate(ra)
             if ra > s.max_retry_after_s or rate_waits >= MAX_RATE_LIMIT_WAITS:
                 raise CarrierLookupError(RATE_LIMIT_MSG.format(ra=ra, cap=s.max_retry_after_s))
             rate_waits += 1
-            # 08 §6.5: CMA's quota is per application — every concurrent CMA call waits at the shared gate.
-            self._blocked_until = max(self._blocked_until, self._monotonic() + ra + RATE_LIMIT_MARGIN_S)
             log.warning("[CMA] rate limited (HTTP 429) — waiting %.0fs as instructed by Retry-After", ra)
 
+    def _close_gate(self, retry_after: float) -> None:
+        until = self._monotonic() + retry_after + RATE_LIMIT_MARGIN_S
+        if until > self._blocked_until:
+            self._blocked_until = until
+            self._gate_retry_after = retry_after
+
+    def _gate_closed(self) -> bool:
+        return self._blocked_until > self._monotonic()
+
+    async def _limiter_slot(self) -> _PrepaidLimiter | None:
+        """Take the proactive limiter's slot for the next attempt here, so the gate can be re-checked after the
+        limiter wait (CRA-02); request_with_auth gets a limiter whose first slot is already paid."""
+        if self._limiter is None:
+            return None
+        await self._limiter.acquire()
+        return _PrepaidLimiter(self._limiter)
+
     async def _wait_if_blocked(self) -> None:
-        """08 §6.5: sleep until the shared gate opens, if it is closed."""
+        """08 §6.5: sleep until the shared gate opens, if it is closed. Review fix CRA-03: a closed window longer than
+        CMA_MAX_RETRY_AFTER_S fails the call at once, without sending, with the text of the 429 that closed it — the
+        same text for every booking, so the circuit breaker (10 §6) can stop the remaining CMA lookups."""
         delay = self._blocked_until - self._monotonic()
-        if delay > 0:
-            log.debug("[CMA] waiting %.1fs at the shared rate-limit gate", delay)
-            await self._sleep(delay)
+        if delay <= 0:
+            return
+        cap = self._settings.max_retry_after_s
+        if delay > cap + RATE_LIMIT_MARGIN_S:
+            raise CarrierLookupError(RATE_LIMIT_MSG.format(ra=self._gate_retry_after, cap=cap))
+        log.debug("[CMA] waiting %.1fs at the shared rate-limit gate", delay)
+        await self._sleep(delay)
 
     def _summary(self, url: str, params: Mapping[str, str], status: int | None, started: float,
                  request_id: str | None, headers: httpx.Headers | None = None, *,

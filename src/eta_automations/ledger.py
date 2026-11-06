@@ -6,8 +6,9 @@ Action names used by the pipeline: `qbo_update`, `emailed` (a QboSend, with the 
 recipients and sent_at / qbo_delivery_time — never the e-mail body), `qbo_revert_doc_number` (D11),
 `vship_comment`, `vship_patch_eta`.
 
-At start-up the ledger indexes every successful `emailed` event, so `emailed_on(invoice_id, day)` can
-answer the same-day e-mail guard (10 §4 Phase 2c) without re-reading the file. Corrupt lines are skipped
+At start-up the ledger indexes every successful `emailed` event, and every failed one whose outcome is unknown
+(`detail.outcome_unknown`: the request may have reached the provider, 04b §7), so `emailed_on(invoice_id, day)`
+can answer the same-day e-mail guard (10 §4 Phase 2c) without re-reading the file. Corrupt lines are skipped
 with a WARNING. A disabled ledger (dry run) never writes, and never creates the file. `detail` passes
 through redact() so no secret can end up in the file (02 §5).
 """
@@ -104,12 +105,16 @@ class Ledger:
             self._index(record)
 
     def _index(self, record: Mapping[str, Any]) -> None:
-        if record.get("action") != EMAILED or record.get("ok") is not True:
+        if record.get("action") != EMAILED:
+            return
+        detail = record.get("detail")
+        # A send whose outcome is unknown may have e-mailed the customer (04b §7): it counts as an e-mail too.
+        unknown = isinstance(detail, Mapping) and detail.get("outcome_unknown") is True
+        if record.get("ok") is not True and not unknown:
             return
         invoice_id = record.get("invoice_id")
         if invoice_id in (None, ""):
             return
-        detail = record.get("detail")
         when = _parse_time(detail.get("sent_at")) if isinstance(detail, Mapping) else None
         if when is None:
             when = _parse_time(record.get("ts"))
@@ -119,11 +124,23 @@ class Ledger:
         self._emails.setdefault(str(invoice_id), []).append(when)
 
     def emailed_on(self, invoice_id: str, day: date) -> datetime | None:
-        """Time of the latest successful QboSend (`emailed`) for this invoice on `day`, else None."""
+        """Time of the latest successful QboSend (`emailed`) for this invoice on `day` — or of a failed one whose
+        outcome is unknown — else None."""
         times = [t for t in self._emails.get(str(invoice_id), []) if t.date() == day]
         return max(times) if times else None
 
     # ── writing ──
+    def _ends_with_newline(self) -> bool:
+        """True for a missing or empty file and for one whose last byte is '\\n'."""
+        try:
+            with open(self.path, "rb") as fh:
+                if fh.seek(0, os.SEEK_END) == 0:
+                    return True
+                fh.seek(-1, os.SEEK_END)
+                return fh.read(1) == b"\n"
+        except FileNotFoundError:
+            return True
+
     def record(self, *, run_id: str, doc_number: str, invoice_id: str | None, base_booking: str | None,
                action: str, detail: Mapping[str, Any], ok: bool) -> None:
         """Append one JSON line and flush + fsync it (never in dry run). `detail` must not hold the e-mail
@@ -143,6 +160,10 @@ class Ledger:
         line = json.dumps(record, ensure_ascii=False, default=_json_default) + "\n"
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            if not self._ends_with_newline():
+                # A torn last line (power loss / full disk during a write): start a new line, so only the torn
+                # line is lost and this record is still read at the next start-up.
+                line = "\n" + line
             with open(self.path, "a", encoding="utf-8", newline="\n") as fh:
                 fh.write(line)
                 fh.flush()

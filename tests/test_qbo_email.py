@@ -107,7 +107,7 @@ class FakeQuickBooks:
         self.prefs_bodies: list[dict[str, Any]] = []
         self.subject_limit: int | None = None
         self.fail_subjects: set[str] = set()
-        self.send_effect: str | None = None          # None | "timeout" | "fault"
+        self.send_effect: str | None = None          # None | "timeout" | "connect" | "fault"
         self.send_delay = 0.0
         self.prefs_delay = 0.0                       # answer delay of a successful Preferences POST
         self.on_send: Callable[[], None] | None = None
@@ -158,6 +158,8 @@ class FakeQuickBooks:
             await asyncio.sleep(self.send_delay)
         if self.send_effect == "timeout":
             raise httpx.ReadTimeout("timed out", request=request)
+        if self.send_effect == "connect":
+            raise httpx.ConnectError("connection refused", request=request)
         if self.send_effect == "fault":
             return httpx.Response(400, json=fault("6000", "Email address is invalid"))
         body = copy.deepcopy(self.send_ok)
@@ -291,6 +293,7 @@ async def test_lost_send_response_without_delivery_is_outcome_unknown(swap_clien
             await swap_client.send_invoice(inv, subject=SUBJECT)
     assert "outcome unknown" in str(info.value)
     assert "check the invoice before re-sending" in str(info.value)
+    assert info.value.outcome_unknown is True                       # RUL-02: the e-mail may have gone out
     assert fake.kinds().count("POST send") == 1                     # never re-POSTed
     assert fake.subject == ORIGINAL and not recovery_file(state_dir).exists()
 
@@ -303,7 +306,139 @@ async def test_rejected_send_is_safe_to_retry(swap_client, load_fixture) -> None
         with pytest.raises(InvoiceSendError) as info:
             await swap_client.send_invoice(make_inv(invoices(load_fixture)[0]), subject=SUBJECT)
     assert "invoice e-mail not sent" in str(info.value) and "safe to retry later" in str(info.value)
+    assert info.value.outcome_unknown is False
     assert fake.subject == ORIGINAL
+
+
+async def test_send_that_never_connected_is_not_sent_and_not_unknown(swap_client, load_fixture,
+                                                                    http_sleeps) -> None:
+    fake = FakeQuickBooks(load_fixture)
+    fake.send_effect = "connect"
+    with respx.mock(assert_all_called=False) as router:
+        fake.mount(router)
+        with pytest.raises(InvoiceSendError) as info:
+            await swap_client.send_invoice(make_inv(invoices(load_fixture)[0]), subject=SUBJECT)
+    assert "invoice e-mail not sent" in str(info.value) and info.value.outcome_unknown is False
+    assert fake.subject == ORIGINAL
+
+
+@pytest.mark.parametrize(("effect", "unknown"), [("timeout", True), ("fault", False)])
+async def test_restore_failure_after_a_failed_send_says_whether_the_outcome_is_unknown(
+        swap_client, state_dir, load_fixture, no_restore_sleep, effect: str, unknown: bool) -> None:
+    """RUL-02: a TemplateRestoreError after a failed /send carries no receipt; it is marked outcome_unknown when the
+    /send request may have reached QuickBooks (timeout), and not when QuickBooks refused it (HTTP 400)."""
+    fake = FakeQuickBooks(load_fixture)
+    fake.send_effect = effect
+    fake.fail_subjects = {ORIGINAL}
+    with respx.mock(assert_all_called=False) as router:
+        fake.mount(router)
+        with pytest.raises(TemplateRestoreError) as info:
+            await swap_client.send_invoice(make_inv(invoices(load_fixture)[0]), subject=SUBJECT)
+    assert getattr(info.value, "receipt", None) is None
+    assert info.value.outcome_unknown is unknown
+
+
+async def test_restore_failure_after_a_lost_send_answer_still_infers_the_delivery(
+        swap_client, state_dir, load_fixture, no_restore_sleep) -> None:
+    """QBO-02 (04b §6.2 step 4): the /send answer was lost AND the restore failed. The read-only inference still runs,
+    so a delivery QuickBooks shows is reported as sent, with its receipt — never as 'No Email Sent' (which would revert
+    the suffix and let a later run e-mail the customer again)."""
+    fake = FakeQuickBooks(load_fixture)
+    fake.send_effect = "timeout"
+    fake.fail_subjects = {ORIGINAL}
+    delivered = (RUN_NOW + timedelta(seconds=3)).astimezone().isoformat()
+    fake.invoice_raw = {**fake.invoice_raw, "DeliveryInfo": {"DeliveryType": "Email", "DeliveryTime": delivered}}
+    with respx.mock(assert_all_called=False) as router:
+        fake.mount(router)
+        with pytest.raises(TemplateRestoreError) as info:
+            await swap_client.send_invoice(make_inv(invoices(load_fixture)[0]), subject=SUBJECT)
+    receipt = getattr(info.value, "receipt", None)
+    assert isinstance(receipt, SendReceipt)
+    assert receipt.outcome_inferred is True and receipt.qbo_delivery_time == delivered
+    assert "WAS sent" in str(info.value)
+    assert f"set the invoice e-mail subject back to: '{ORIGINAL}'" in str(info.value)    # the manual instructions
+    assert fake.kinds().count("GET invoice") == 1 and fake.kinds().count("POST send") == 1
+    assert isinstance(info.value.__cause__.__cause__, httpx.ReadTimeout)          # chained from the send failure
+    emailer = swap_client.emailer
+    assert isinstance(emailer, TemplateSwapEmailer) and emailer.broken     # the template still needs the manual fix
+
+
+@pytest.mark.parametrize(("effect", "outcome", "unknown"),
+                         [("timeout", "outcome unknown", True), ("fault", "invoice e-mail not sent", False)])
+async def test_restore_failure_after_a_failed_send_reports_the_inferred_outcome(
+        swap_client, state_dir, load_fixture, no_restore_sleep, effect: str, outcome: str, unknown: bool) -> None:
+    """QBO-02: without a fresh DeliveryTime the TemplateRestoreError says what the inference found ('outcome unknown'
+    after a timeout, 'not sent' after a refusal), next to the manual restore instructions."""
+    fake = FakeQuickBooks(load_fixture)
+    fake.send_effect = effect
+    fake.fail_subjects = {ORIGINAL}
+    with respx.mock(assert_all_called=False) as router:
+        fake.mount(router)
+        with pytest.raises(TemplateRestoreError) as info:
+            await swap_client.send_invoice(make_inv(invoices(load_fixture)[0]), subject=SUBJECT)
+    assert getattr(info.value, "receipt", None) is None
+    assert outcome in str(info.value) and info.value.outcome_unknown is unknown
+    assert f"set the invoice e-mail subject back to: '{ORIGINAL}'" in str(info.value)
+    assert fake.kinds().count("GET invoice") == 1
+
+
+async def test_cancelling_a_send_during_its_restore_holds_the_lock_until_the_restore_ends(
+        swap_client, state_dir, load_fixture) -> None:
+    """QBO-07 (04b §6.2 step 3, §9 test 6): a send cancelled while its shielded restore runs keeps the template lock
+    until the template is back. The queued send then finds the original subject — no false 'broken' e-mailer."""
+    fake = FakeQuickBooks(load_fixture)
+    raws = invoices(load_fixture)
+
+    def slow_restore_answer() -> None:
+        fake.prefs_delay = 0.3              # send #1's restore is applied in QuickBooks, but its answer is slow
+        fake.on_send = None
+
+    with respx.mock(assert_all_called=False) as router:
+        fake.mount(router)
+        await swap_client.prepare_for_sending()
+        fake.on_send = slow_restore_answer
+        first = asyncio.create_task(swap_client.send_invoice(make_inv(raws[0]), subject=SUBJECT))
+        second = asyncio.create_task(swap_client.send_invoice(make_inv(raws[1]), subject=SUBJECT_B))
+        for _ in range(2000):
+            if fake.kinds().count("POST prefs") >= 2:            # send #1's restore POST is in flight
+                break
+            await asyncio.sleep(0.001)
+        assert fake.kinds().count("POST prefs") == 2
+        fake.prefs_delay = 0.0                                   # later answers are quick again
+        first.cancel()
+        r1, r2 = await asyncio.gather(first, second, return_exceptions=True)
+    assert isinstance(r1, asyncio.CancelledError)
+    assert isinstance(r2, SendReceipt) and r2.subject == SUBJECT_B
+    emailer = swap_client.emailer
+    assert isinstance(emailer, TemplateSwapEmailer) and emailer.broken is None
+    assert fake.events == [("GET prefs",), ("POST prefs", SUBJECT), ("POST send", SUBJECT, None),
+                           ("POST prefs", ORIGINAL), ("POST prefs", SUBJECT_B), ("POST send", SUBJECT_B, None),
+                           ("POST prefs", ORIGINAL)]
+    assert fake.subject == ORIGINAL and not recovery_file(state_dir).exists()
+
+
+async def test_a_cancelled_send_whose_restore_fails_stays_cancelled(swap_client, state_dir, load_fixture,
+                                                                    no_restore_sleep) -> None:
+    """QBO-07: a cancellation is never turned into a TemplateRestoreError. The failed restore is still recorded (the
+    e-mailer is broken, so every later send is refused with the manual instructions)."""
+    fake = FakeQuickBooks(load_fixture)
+    fake.send_delay = 5.0
+    fake.fail_subjects = {ORIGINAL}
+    with respx.mock(assert_all_called=False) as router:
+        fake.mount(router)
+        task = asyncio.create_task(swap_client.send_invoice(make_inv(invoices(load_fixture)[0]), subject=SUBJECT))
+        for _ in range(2000):
+            if "POST send" in fake.kinds():
+                break
+            await asyncio.sleep(0.001)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    emailer = swap_client.emailer
+    assert isinstance(emailer, TemplateSwapEmailer) and emailer.broken
+    assert fake.kinds().count("POST prefs") == 1 + 3                   # the swap, then three restore attempts
+    with pytest.raises(TemplateRestoreError):
+        await swap_client.send_invoice(make_inv(invoices(load_fixture)[1]), subject=SUBJECT_B)
 
 
 # ── test 3 ──
@@ -626,6 +761,30 @@ async def test_redirect_allowed_when_recipient_already_is_the_redirect(make_sett
     assert ("POST send", SUBJECT, "Test@Example.com") in fake.events
 
 
+@pytest.mark.parametrize(("case", "env", "bill_email", "refused"), [
+    ("production, a customer", {}, "ap@acme.example", True),
+    ("production, no BillEmail", {}, None, True),
+    ("BillEmail already is the redirect", {}, "Shadow@Example.com", False),
+    ("sandbox", {"QB_SANDBOX": "true"}, "ap@acme.example", False),
+    ("graph", GRAPH_ENV, "ap@acme.example", False),
+    ("smtp", SMTP_ENV, "ap@acme.example", False),
+    ("no redirect", {"QB_EMAIL_REDIRECT_TO": None}, "ap@acme.example", False),
+])
+def test_redirect_refusal_is_the_04b_rule_as_a_pure_check(make_settings, load_fixture, case: str,
+                                                          env: dict[str, Any], bill_email: str | None,
+                                                          refused: bool) -> None:
+    """QBO-03: the 04b §3 redirect rule as a pure check, so the pipeline can fail a row while planning (before its
+    DocNumber is suffixed) exactly when TemplateSwapEmailer.send() would refuse it."""
+    settings = make_settings({"QB_EMAIL_REDIRECT_TO": "shadow@example.com", **env})
+    assert settings.qbo is not None
+    raw = invoices(load_fixture)[0]
+    raw.pop("BillEmail", None)
+    if bill_email is not None:
+        raw["BillEmail"] = {"Address": bill_email}
+    assert qbo_email.redirect_refusal(settings.qbo, make_inv(raw)) == (
+        qbo_email.REDIRECT_NOT_ALLOWED if refused else None)
+
+
 # ── test 10 ──
 async def test_stale_preferences_on_first_write_rereads_and_retries_once(swap_client, load_fixture) -> None:
     fake = FakeQuickBooks(load_fixture)
@@ -770,6 +929,28 @@ async def test_graph_read_timeout_is_never_retried(make_settings, state_dir, tok
         assert qbo["mark"].call_count == 0
     assert str(info.value) == ("e-mail outcome unknown — check the Sent Items of accounting@example.com before "
                                "re-sending")
+    assert info.value.outcome_unknown is True
+
+
+@pytest.mark.parametrize(("effect", "unknown"), [
+    (httpx.Response(500), True),
+    (httpx.ConnectError("connection refused"), False),
+    (httpx.Response(400, json={"error": {"code": "ErrorInvalidRecipients"}}), False),
+])
+async def test_graph_send_outcome_unknown_flag(make_settings, state_dir, token_store, load_fixture, http_sleeps,
+                                               effect: Any, unknown: bool) -> None:
+    client = graph_client(make_settings, state_dir, token_store)
+    with respx.mock(assert_all_called=False) as router:
+        router.post(GRAPH_TOKEN_URL).mock(return_value=httpx.Response(200, json=load_fixture("graph/token.json")))
+        if isinstance(effect, httpx.Response):
+            router.post(GRAPH_SEND_URL).mock(return_value=effect)
+        else:
+            router.post(GRAPH_SEND_URL).mock(side_effect=effect)
+        mount_mailbox_qbo(router, load_fixture)
+        with pytest.raises(InvoiceSendError) as info:
+            await client.send_invoice(mailbox_invoice(load_fixture), subject=SUBJECT)
+    assert info.value.outcome_unknown is unknown
+    assert ("outcome unknown" in str(info.value)) is unknown
 
 
 async def test_graph_429_with_retry_after_is_retried(make_settings, state_dir, token_store, load_fixture,
@@ -952,14 +1133,14 @@ async def test_smtp_ssl_mode_and_rejected_login(make_settings, state_dir, token_
     assert "smtp-pass" not in str(info.value)
 
 
-@pytest.mark.parametrize(("error", "expected"), [
+@pytest.mark.parametrize(("error", "expected", "unknown"), [
     (smtplib.SMTPServerDisconnected("lost"),
-     "e-mail outcome unknown — check the Sent Items of accounting@example.com before re-sending"),
+     "e-mail outcome unknown — check the Sent Items of accounting@example.com before re-sending", True),
     (smtplib.SMTPRecipientsRefused({"ap@acme.example": (550, b"no such user")}),
-     "smtp: e-mail not sent (rejected by the server)"),
+     "smtp: e-mail not sent (rejected by the server)", False),
 ])
 async def test_smtp_send_errors(make_settings, state_dir, token_store, load_fixture, monkeypatch, error: Exception,
-                                expected: str) -> None:
+                                expected: str, unknown: bool) -> None:
     monkeypatch.setattr(smtplib, "SMTP", fake_smtp_class(send_error=error))
     client = smtp_client(make_settings, state_dir, token_store)
     with respx.mock(assert_all_called=False) as router:
@@ -968,6 +1149,7 @@ async def test_smtp_send_errors(make_settings, state_dir, token_store, load_fixt
             await client.send_invoice(mailbox_invoice(load_fixture), subject=SUBJECT)
         assert qbo["mark"].call_count == 0
     assert str(info.value).startswith(expected)
+    assert info.value.outcome_unknown is unknown
 
 
 # ── test 13 ──

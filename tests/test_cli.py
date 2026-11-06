@@ -461,6 +461,22 @@ def test_missing_env_file_and_malformed_settings_exit_2(write_env: Callable[...,
     assert "ETA_MAX_PARALLEL_BOOKINGS" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(("name", "data"), [
+    ("cp1252.env", b"VSHIP_USER_NAME=ops@example.com\nVSHIP_PASSWORD=Pass\xe9word\n"),          # Windows "ANSI"
+    ("utf16.env", "VSHIP_PASSWORD=Passéword\n".encode("utf-16")),                               # BOM ff fe
+])
+def test_env_file_that_is_not_utf8_is_a_configuration_error(name: str, data: bytes, tmp_path: Path,
+                                                            capsys: pytest.CaptureFixture[str]) -> None:
+    """CLI-02: a .env saved as cp1252 or UTF-16 (PowerShell `>`, Notepad 'Unicode') is a configuration error (11 §3
+    exit 2) that names the file and says to save it as UTF-8 — not an 'Unexpected error' traceback (exit 1)."""
+    path = tmp_path / name
+    path.write_bytes(data)
+    assert run_cli(["msc-token", "--env-file", str(path)]) == 2
+    err = capsys.readouterr().err
+    assert str(path) in err and "UTF-8" in err
+    assert "Traceback" not in err and "Unexpected error" not in err
+
+
 def test_repository_dot_env_is_never_loaded(write_env: Callable[..., Path], tmp_path: Path) -> None:
     assert Path.cwd() == tmp_path and Path.cwd() != REPO_ROOT
     (tmp_path / ".env").write_text("ETA_MAX_PARALLEL_BOOKINGS=not-a-number\n", encoding="utf-8")
@@ -1178,6 +1194,9 @@ def test_probe_qbo_prefs_roundtrip_stops_when_the_write_back_is_lossy(
     assert "1. write back unchanged: FAIL" in out and "SalesFormsPrefs.SalesEmailBcc" in out
     assert "use QB_EMAIL_STRATEGY=graph" in out
     assert qb.subject == ORIGINAL_SUBJECT and not (tmp_path / "state" / RECOVERY_FILE_NAME).exists()
+    # CLI-03: the lossy write-back cannot be undone by the probe — it says which settings to restore by hand
+    assert "cannot undo" in out and "restore them by hand" in out
+    assert "    SalesFormsPrefs.SalesEmailBcc: set it back to {'Address': 'accounting@example.com'}" in out
 
 
 def test_probe_qbo_prefs_roundtrip_keeps_the_recovery_file_when_the_restore_fails(
@@ -1268,6 +1287,27 @@ def test_probe_qbo_send_test_never_emails_a_real_customer_on_production(
     assert answers.prompts[1].startswith(f"Check {test_inbox}.")
 
 
+@pytest.mark.parametrize(("field", "test_send_to", "refusal"), [
+    ("BillEmailCc", "ap@gamma.example", "also sends copies to real.customer@gamma.example"),
+    ("BillEmailBcc", "ap@gamma.example", "also sends copies to real.customer@gamma.example"),
+    (None, None, "QB_TEST_SEND_TO is not set"),
+])
+def test_probe_qbo_send_test_refuses_copies_and_a_missing_test_inbox_on_production(
+        field: str | None, test_send_to: str | None, refusal: str, quickbooks: Callable[..., FakeQuickBooks],
+        sent: list[dict[str, Any]], write_env: Callable[..., Path], tmp_path: Path, console: Callable[..., Console],
+        fixed_now: datetime, capsys: pytest.CaptureFixture[str]) -> None:
+    """CLI-05: on production the send test e-mails only QB_TEST_SEND_TO — a Cc/Bcc to anyone else on the test invoice,
+    or no QB_TEST_SEND_TO at all, is refused before any prompt or send (stricter than 04b §10)."""
+    qb = quickbooks(sandbox=False)
+    if field is not None:
+        qb.invoices["190801"][field] = {"Address": "real.customer@gamma.example"}   # invoice 267546627
+    answers = console("y", "y")
+    env = str(write_env(QB_TEST_SEND_TO=test_send_to))
+    assert run_cli(["probe", "qbo", "--send-test", "--invoice", "267546627", "--yes", "--env-file", env]) == 3
+    assert refusal in capsys.readouterr().out
+    assert sent == [] and answers.prompts == [] and load_verifications(tmp_path / "state") == []
+
+
 def test_probe_qbo_send_test_configuration_error_exits_2(quickbooks: Callable[..., FakeQuickBooks],
                                                         write_env: Callable[..., Path], tmp_path: Path,
                                                         console: Callable[..., Console], fixed_now: datetime,
@@ -1354,6 +1394,23 @@ def test_qbo_auth_with_a_configured_realm_and_errors(auth_flow: dict[str, Any], 
     auth_flow.clear()
     assert run_cli(["qbo-auth", "--env-file", str(write_env(QB_REALM_ID=None, QB_CLIENT_SECRET=None))]) == 2
     assert "QB_CLIENT_SECRET" in capsys.readouterr().err and auth_flow == {}
+
+
+def test_qbo_auth_holds_the_run_lock(auth_flow: dict[str, Any], write_env: Callable[..., Path], tmp_path: Path,
+                                     capsys: pytest.CaptureFixture[str]) -> None:
+    """03 §14 (FND-01): `qbo-auth` writes tokens.json and .env, so it holds the run lock; a running `eta run` would
+    otherwise write its older refresh token over the new authorization (04 §5.3)."""
+    state = tmp_path / "state"
+    state.mkdir()
+    env = write_env()
+    with run_lock(state):
+        assert run_cli(["qbo-auth", "--env-file", str(env)]) == 2
+    assert "Another ETAutomationsAPI run is in progress" in capsys.readouterr().err
+    assert auth_flow == {}                                                     # the OAuth flow never started
+    assert run_cli(["qbo-auth", "--env-file", str(env)]) == 0                  # control: lock free → the flow runs
+    assert auth_flow["token_store"].path == state / "tokens.json"
+    with run_lock(state):                                                      # and the lock was released again
+        pass
 
 
 def test_msc_token_is_stored_and_never_echoed(monkeypatch: pytest.MonkeyPatch, write_env: Callable[..., Path],

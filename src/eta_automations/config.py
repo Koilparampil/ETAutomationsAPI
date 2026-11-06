@@ -770,7 +770,13 @@ def load_settings(env_file: Path | str | None = None, *, env: Mapping[str, Any] 
         if env_file is not None and not path.is_file():
             raise ConfigError(f"Settings file not found: {path}")
         # utf-8-sig: tolerate a BOM written by Windows editors
-        load_dotenv(path, override=True, encoding="utf-8-sig")
+        try:
+            load_dotenv(path, override=True, encoding="utf-8-sig")
+        except UnicodeError as exc:   # cp1252 "ANSI", or UTF-16 from PowerShell `>` / Notepad "Unicode"
+            raise ConfigError(f"Cannot read the settings file {path} ({type(exc).__name__}): "
+                              "save it as UTF-8 text") from exc
+        except OSError as exc:
+            raise ConfigError(f"Cannot read the settings file {path}: {exc}") from exc
         source: dict[str, str] = dict(os.environ)
         recorded_env_file: Path | None = path.absolute()
     else:

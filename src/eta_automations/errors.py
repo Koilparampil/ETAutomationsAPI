@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Self
 
-from .logging_setup import redact
+from .logging_setup import redact_excerpt
 
 __all__ = [
     "AggregatorBookingError",
@@ -70,7 +70,7 @@ class ServiceError(EtaAutomationError):
         self.service: str = service
         self.message: str = message
         self.status: int | None = status
-        self.body_excerpt: str = redact(body_excerpt or "")[:BODY_EXCERPT_MAX]
+        self.body_excerpt: str = redact_excerpt(body_excerpt or "", BODY_EXCERPT_MAX)
         self.request_id: str | None = request_id
         super().__init__(self._format())
 
@@ -157,7 +157,13 @@ class InvoiceUpdateError(ServiceError):
 
 
 class InvoiceSendError(ServiceError):
-    """An invoice e-mail could not be sent (04 §6.6, 04b)."""
+    """An invoice e-mail could not be sent (04 §6.6, 04b).
+
+    `outcome_unknown` is True when the request may have reached the provider (a timeout, a 5xx or a lost answer
+    after the request went out): the e-mail may have been delivered, so the pipeline records it in the ledger as
+    possibly e-mailed and the same-day guard blocks a resend until --force (04b §7)."""
+
+    outcome_unknown: bool = False
 
 
 class EmailPathUnavailableError(InvoiceSendError):

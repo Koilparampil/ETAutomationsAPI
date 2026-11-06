@@ -148,6 +148,48 @@ async def test_cached_fresh_token_needs_no_refresh_and_tokens_are_never_logged(
     assert "access_token" in caplog.text    # 04 §5.1: the raw key NAMES are logged at DEBUG
 
 
+async def test_rotated_refresh_token_survives_a_failed_token_store_write(
+        make_settings, token_store, tmp_path, caplog, monkeypatch) -> None:
+    """QBO-06 (04 §5.1: always persist the newest refresh token; the old one may stop working). When tokens.json cannot
+    be written, the rotated refresh token is still used by this process and written back to .env, and the refresh
+    does not fail; the ERROR names tokens.json, never a token."""
+    caplog.set_level(logging.DEBUG, logger="eta")
+    env_file = tmp_path / ".env"
+    env_file.write_text("QB_REFRESH_TOKEN=RT-OLD\n", encoding="utf-8")
+    settings = make_settings({"QB_REFRESH_TOKEN": "RT-OLD"}, env_file=env_file).qbo
+    real_put = token_store.put
+    refused: list[str] = []
+
+    def put_failing_once(key: str, value: dict[str, Any]) -> None:
+        if not refused:
+            refused.append(key)
+            raise PermissionError(13, "Permission denied", str(token_store.path))   # e.g. a Windows sharing violation
+        real_put(key, value)
+
+    monkeypatch.setattr(token_store, "put", put_failing_once)
+    sent: list[str] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        sent.append(form(request)["refresh_token"][0])
+        return httpx.Response(200, json={"token_type": "bearer", "access_token": f"AT-NEW-{len(sent)}",
+                                         "expires_in": 3600, "refresh_token": "RT-ROTATED",
+                                         "x_refresh_token_expires_in": 8726400})
+
+    auth = new_auth(settings, token_store)
+    with respx.mock() as router:
+        router.post(TOKEN_URL).mock(side_effect=answer)
+        assert await auth.get_token() == "AT-NEW-1"
+        assert "QB_REFRESH_TOKEN=RT-ROTATED" in env_file.read_text(encoding="utf-8")    # not lost: .env holds it
+        await auth.force_refresh()
+    await auth.aclose()
+    assert refused == ["qbo"]
+    assert sent == ["RT-OLD", "RT-ROTATED"]                       # the rotated token is the one used next
+    assert (TokenStore(token_store.path).get("qbo") or {}).get("refresh_token") == "RT-ROTATED"   # 2nd put worked
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors and "tokens.json" in errors[0]
+    assert not any("RT-ROTATED" in r.getMessage() or "AT-NEW" in r.getMessage() for r in caplog.records)
+
+
 # ── test 2 ──
 async def test_seeding_store_newer_than_env_uses_store_token(make_settings, token_store, load_fixture) -> None:
     token_store.put("qbo", stored_entry(refresh_token="RT-STORE", refresh_token_seed="test-qb-refresh-token"))
@@ -309,6 +351,27 @@ async def test_invalidate_drops_access_token_only(make_settings, token_store) ->
     entry = token_store.get("qbo")
     assert entry is not None
     assert entry["expires_at"] == 0 and entry["refresh_token"] == "RT-STORE"
+
+
+async def test_invalidate_with_an_unwritable_token_store_drops_the_token_in_memory(
+        make_settings, token_store, load_fixture, monkeypatch, caplog) -> None:
+    """QBO-06: a tokens.json write failure in invalidate() (after a 401) does not escape the QuickBooks call; the
+    rejected access token is dropped in memory, so the next get_token() refreshes."""
+    caplog.set_level(logging.ERROR, logger="eta")
+    token_store.put("qbo", stored_entry(access_token="AT-LIVE", expires_at=NOW + 3000))
+    auth = new_auth(qbo_settings(make_settings), token_store)
+    assert await auth.get_token() == "AT-LIVE"
+
+    def refuse(key: str, value: dict[str, Any]) -> None:
+        raise PermissionError(13, "Permission denied", str(token_store.path))
+
+    monkeypatch.setattr(token_store, "put", refuse)
+    await auth.invalidate()
+    assert any("tokens.json" in m for m in caplog.messages)
+    with respx.mock() as router:
+        route = router.post(TOKEN_URL).mock(return_value=token_response(load_fixture))
+        assert await auth.get_token() == "AT-NEW-123"
+    assert route.call_count == 1 and form(route.calls.last.request)["refresh_token"] == ["RT-STORE"]
 
 
 # ── test 8 ──

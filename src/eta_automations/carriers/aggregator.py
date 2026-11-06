@@ -57,7 +57,7 @@ from ..errors import (
     ServiceError,
 )
 from ..http import AsyncLimiter, json_body, new_async_client, request, request_id_from
-from ..logging_setup import MASK, redact
+from ..logging_setup import MASK, REDACT_INPUT_MAX, redact, redact_excerpt
 from ..models import Carrier, EtaResult
 from . import dcsa
 from .base import error_text
@@ -441,7 +441,7 @@ def _error_message(resp: httpx.Response) -> str:
         message = _text(body.get("message"))
         if message:
             return redact(message)
-    excerpt = redact(_response_text(resp)).strip()[:200]
+    excerpt = redact_excerpt(_response_text(resp), REDACT_INPUT_MAX).strip()[:200]
     return excerpt or "no details"
 
 
@@ -592,7 +592,7 @@ class ShipsGoBackend:
             return CarrierLookupError(
                 f"ShipsGo rejected booking {booking} for carrier {scac} (HTTP 422): {_error_message(resp)}")
         return ServiceError(SERVICE, f"unexpected HTTP {status} for {method} {path}", status=status,
-                            body_excerpt=redact(_response_text(resp))[:500],
+                            body_excerpt=redact_excerpt(_response_text(resp), 500),
                             request_id=request_id_from(resp.headers))
 
 
@@ -607,10 +607,12 @@ class TrackingState:
     the next put(). Writes are atomic (temp file in the same directory + os.replace) under a
     threading.Lock, and re-read the file first so that entries written meanwhile by another process (e.g.
     a concurrent `eta eta`) are kept. No secrets live here. Entries are only removed by forget().
+    `read_only` (a dry run, CRA-01): changes are kept in memory for this run and never written.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, read_only: bool = False) -> None:
         self.path = Path(path)
+        self.read_only = bool(read_only)
         self._lock = threading.Lock()
         self._entries: dict[str, dict[str, Any]] | None = None
 
@@ -675,7 +677,8 @@ class TrackingState:
             payload = json.dumps({"version": STATE_VERSION, "entries": entries}, indent=2, sort_keys=True,
                                  ensure_ascii=False) + "\n"
             self._entries = entries
-            self._write_atomic(payload)
+            if not self.read_only:
+                self._write_atomic(payload)
 
     def _write_atomic(self, payload: str) -> None:
         directory = self.path.parent
@@ -701,10 +704,11 @@ class AggregatorClient:
 
     def __init__(self, settings: AggregatorSettings, *, backend: AggregatorBackend | None = None,
                  state: TrackingState | None = None, clock: Clock | None = None,
-                 sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> None:
+                 sleep: Callable[[float], Awaitable[None]] = asyncio.sleep, read_only: bool = False) -> None:
         self._settings = settings
+        self._read_only = bool(read_only)         # a dry run: never registers, never writes the state file
         self._backend: AggregatorBackend = backend if backend is not None else ShipsGoBackend(settings)
-        self._state = state if state is not None else TrackingState(settings.state_file)
+        self._state = state if state is not None else TrackingState(settings.state_file, read_only=read_only)
         self._clock: Clock = clock if clock is not None else SystemClock()
         self._sleep = sleep                       # injectable for tests (poll waits)
         self._create_lock = asyncio.Lock()        # creates are processed one at a time per company (§B.5)
@@ -724,6 +728,17 @@ class AggregatorClient:
     @property
     def state(self) -> TrackingState:
         return self._state
+
+    @property
+    def read_only(self) -> bool:
+        """True in a dry run (CRA-01): no registration (1 credit each) and no state-file write."""
+        return self._read_only
+
+    def set_read_only(self) -> None:
+        """Dry run (11 §2: nothing is written anywhere; review fix CRA-01): from now on never register a booking
+        (1 credit each) and keep tracking-state changes in memory only. There is no way back."""
+        self._read_only = True
+        self._state.read_only = True
 
     @property
     def creates_this_run(self) -> int:
@@ -963,6 +978,9 @@ class AggregatorClient:
         if not allow_create:
             raise AggregatorBookingError(
                 f"{carrier} booking {ref} is not tracked in {name} and AGG_ALLOW_CREATE=false")
+        if self._read_only:  # a dry run writes nothing anywhere (11 §2) and spends no credit
+            raise AggregatorBookingError(
+                f"{carrier} booking {ref} is not registered with {name} yet — a real run registers it (1 credit)")
         self._check_create_cap(ref)
         async with self._create_lock:  # serialised creates (ShipsGo answers 429 to concurrent ones)
             entry = self._known_entry(scac, ref)  # another coroutine may have just created it
@@ -1175,7 +1193,8 @@ def build_client(settings: Settings, token_store: TokenStore | None, *, clock: C
                  http: httpx.AsyncClient | None = None) -> AggregatorClient | None:
     """None when settings.aggregator is None (AGG_API_TOKEN missing). `token_store` is unused (static
     token, 09 §B.6). Unlike the carrier modules this returns the multi-carrier client; the router asks it
-    for views (09 §B.7.1). `http` is passed to the backend (tests inject a respx-mocked client)."""
+    for views (09 §B.7.1). `http` is passed to the backend (tests inject a respx-mocked client). A dry run
+    switches the client to read-only with set_read_only() (the 03 §9 factory signature stays as it is)."""
     agg = settings.aggregator
     if agg is None:
         return None

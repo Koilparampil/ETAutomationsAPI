@@ -161,5 +161,8 @@ def jwt_exp(token: str) -> float | None:
     exp = claims.get("exp")
     if isinstance(exp, bool) or not isinstance(exp, (int, float)):
         return None
-    value = float(exp)
+    try:
+        value = float(exp)
+    except OverflowError:  # an integer too large for a float (JSON allows any number of digits)
+        return None
     return value if math.isfinite(value) else None

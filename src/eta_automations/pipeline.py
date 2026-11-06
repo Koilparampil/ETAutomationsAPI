@@ -64,7 +64,9 @@ from .models import (
     VShipPatchEta,
 )
 from .outputs import OutputWriter, write_report
+from .prompt import read_line
 from .qbo.client import ambiguous_invoice_error, build_qbo, doc_number_problem, split_addresses
+from .qbo.email import RECOVERY_FILE_NAME, redirect_refusal
 from .rules import (
     arrival_doc_number,
     carrier_failure,
@@ -149,7 +151,8 @@ async def _close_quietly(name: str, closer: Callable[[], Awaitable[None]]) -> No
 @asynccontextmanager
 async def build_services(settings: Settings, run_now: datetime, *, read_only: bool) -> AsyncIterator[Services]:
     """TokenStore(<ETA_STATE_DIR>/tokens.json), build_qbo(read_only) (04 §6.8), build_vship(read_only) (05 §6.2),
-    build_router() with every carrier client (09 §D.2, clock=FixedClock(run_now)), OutputWriter(enabled=not
+    build_router(read_only) with every carrier client (09 §D.2, clock=FixedClock(run_now); a read-only aggregator
+    never registers bookings nor writes its state file), OutputWriter(enabled=not
     read_only) and Ledger (never written when read_only). On exit every client is closed (in a finally) —
     QboClient.aclose() also closes the e-mail strategy, which restores the QBO template if a recovery record
     exists (04b §6.2)."""
@@ -161,7 +164,7 @@ async def build_services(settings: Settings, run_now: datetime, *, read_only: bo
         stack.push_async_callback(_close_quietly, "QuickBooks client", qbo.aclose)
         vship = build_vship(settings, token_store, read_only=read_only)
         stack.push_async_callback(_close_quietly, "VShip client", vship.aclose)
-        router = build_router(settings, token_store, clock=clock)
+        router = build_router(settings, token_store, clock=clock, read_only=read_only)   # CRA-01: no credits
         stack.push_async_callback(_close_quietly, "carrier clients", router.aclose)
         yield Services(
             settings=settings,
@@ -374,7 +377,7 @@ class _Run:
         self.timings: dict[str, float] = {}
         self.email_blocked = False
         self.email_error: BaseException | None = None
-        self.restore_error: TemplateRestoreError | None = None
+        self.restore_error: BaseException | None = None   # the QBO e-mail template must be restored by hand
         self.output_errors = 0
         self.report_stage = "plan"
         self.summary = RunSummary(run_id=self.run_id, dry_run=dry_run, log_file=log_file)
@@ -509,7 +512,10 @@ class _Run:
         if code is not None:
             if code == EXIT_ABORTED:
                 self.report_stage = "aborted"
-                self._write_report(final_code=code)
+                try:
+                    self._write_report(final_code=code)
+                except OSError as exc:   # e.g. the report is open in Excel: nothing was changed, still exit 3
+                    log.error("Could not rewrite the run report: %s", exc)
             self.summary.exit_code = code
             return self._summarize(code)
 
@@ -622,6 +628,36 @@ class _Run:
                     log.exception("Unexpected error while finalizing #%s", row.plan.doc_number)
                     self._fail(row, texts.qb_processing_error_entry(row.plan.doc_number, exc),
                                reason="QB Invoice Processing Error", error=str(exc))
+        self._one_notice_per_booking()
+
+    def _one_notice_per_booking(self) -> None:
+        """Rows of one booking ('X' and 'X A', a normal input pair, 10 §6) are decided from one read of its VShip notes
+        (D18), but the original handled rows one at a time and read the notes again for each, so a later row saw the
+        note an earlier row had just posted. Replay that in input order: each NOTIFY plan adds its planned note to
+        the booking's notes, and a later NOTIFY plan of the same booking is decided again with them (01 §6 step 3,
+        §11): NOTIF #2 → Ben, a NOTIF #1 of today → 'Done in the last week'. 'ARRIVING ON' notes are no notices, so
+        those rows are unchanged (O4)."""
+        planned: dict[str, list[dict[str, Any]]] = {}
+        for row in self.rows:
+            plan = row.plan
+            if plan.route is not Route.NOTIFY or not plan.actions:
+                continue
+            key = plan.vship_booking_id or plan.base_booking or plan.doc_number
+            notes = planned.setdefault(key, [])
+            if notes:
+                notif = notif_status([*(row.comments or []), *notes], self.run_now)
+                if notif.count == 2 or not notif.have_to_do:
+                    log.info("#%s: same booking as an earlier row of this run, which sends a notice now",
+                             plan.doc_number)
+                    plan.notif = notif
+                    if notif.count == 2:
+                        self._route(row, Route.BEN, OutputFile.BEN, texts.ben_entry(plan.doc_number))
+                    else:
+                        self._fail(row, texts.done_in_last_week_entry(plan.doc_number), reason="Done in the last week")
+                    continue
+            comment = next((a for a in plan.actions if isinstance(a, VShipComment)), None)
+            if comment is not None:
+                notes.append({"comment": comment.text, "createdDate": self.run_now.isoformat()})
 
     async def _plan_row_task(self, row: _Row, sem: asyncio.Semaphore) -> None:
         """A plan task never raises (10 Phase 2): every exception becomes a FAILED plan with a 01 §14 entry."""
@@ -840,6 +876,13 @@ class _Run:
             self._fail(row, texts.qb_processing_error_entry(doc, texts.BILL_EMAIL_MISSING_REASON),
                        reason="invoice has no BillEmail", error=texts.BILL_EMAIL_MISSING_REASON)
             return
+        refusal = redirect_refusal(self.settings.qbo, inv) if self.settings.qbo is not None else None
+        if refusal and not self.no_email:
+            # 04b §3 (review fix QBO-03): template_swap would refuse this send. Fail the row now, before its DocNumber
+            # is suffixed (04 §6.6) — not at the send, after the QuickBooks update. --no-email sends nothing.
+            self._fail(row, texts.qb_processing_error_entry(doc, refusal),
+                       reason="QB_EMAIL_REDIRECT_TO not allowed with template_swap", error=refusal)
+            return
         if new_doc is not None and self.settings.qbo is not None:
             problem = doc_number_problem(new_doc, self.settings.qbo)                        # 04 §7
             if problem:
@@ -881,11 +924,13 @@ class _Run:
             for row in self.rows:
                 if row.plan.route is Route.NOTIFY and row.plan.actions:
                     self._to_manual(row)
-        if any(isinstance(a, QboSend) for r in self.rows for a in r.plan.actions):          # step 2
+        sends = any(isinstance(a, QboSend) for r in self.rows for a in r.plan.actions)
+        if sends:                                                                           # step 2
             try:
                 await self.qbo.prepare_for_sending(dry_run=self.dry_run)
             except Exception as exc:  # noqa: BLE001 - any problem with the e-mail path blocks every e-mail
                 self._email_path_failed(exc, before_apply=True)
+        await self._repair_email_template(template_swap_preflight_ran=sends)
         self._write_report()                                                                # step 3
         self._print_plan_summary()                                                          # step 4
         if self.dry_run:                                                                    # step 5
@@ -905,7 +950,7 @@ class _Run:
             return EXIT_ABORTED
         prompt = (f"Apply {n_actions} change(s) to {n_rows} invoice(s) and send {n_emails} e-mail(s)? [y/N] ")
         try:
-            answer = await asyncio.to_thread(self.input_fn, prompt)
+            answer = await read_line(self.input_fn, prompt)   # interruptible: one Ctrl+C ends the process
         except EOFError:
             answer = ""
         if str(answer).strip().lower() not in _YES:
@@ -913,6 +958,32 @@ class _Run:
             self._print(self.summary.message)
             return EXIT_ABORTED
         return None
+
+    async def _repair_email_template(self, *, template_swap_preflight_ran: bool) -> None:
+        """Step 2's repair for every real run (04b §6.2 step 1; review fix XCT-03): a QuickBooks invoice e-mail subject
+        left swapped by a crashed template_swap run is restored before the prompt. The template_swap preflight does it
+        for runs that send through template_swap; this covers the others — nothing to e-mail, --no-email,
+        QB_EMAIL_STRATEGY=graph/smtp — so the company-wide subject never keeps naming another customer's booking.
+        A dry run only warns; a failure is printed with the manual instructions and makes the run exit 4."""
+        qbo_settings = self.settings.qbo
+        recovery = self.settings.run.state_dir / RECOVERY_FILE_NAME
+        if qbo_settings is None or not recovery.exists():
+            return
+        if self.dry_run:
+            self._print(f"Warning: the QuickBooks invoice e-mail subject may still be modified by a crashed run "
+                        f"({recovery}); a real run restores it before its prompt.")
+            return
+        if template_swap_preflight_ran and qbo_settings.email_strategy == "template_swap":
+            return
+        try:
+            await self.qbo.recover_email_template()
+        except Exception as exc:  # noqa: BLE001 - reported with the manual restore instructions
+            self.restore_error = exc
+            log.error("The QuickBooks invoice e-mail template could not be restored: %s", exc)
+            self._print(_BANNER)
+            self._print("THE QUICKBOOKS INVOICE E-MAIL TEMPLATE COULD NOT BE RESTORED:")
+            self._print(str(exc))
+            self._print(_BANNER)
 
     def _to_manual(self, row: _Row) -> None:
         """--no-email (10 Phase 3 step 1): keep only the ETA update (no DocNumber suffix) and the VShip ETA patch;
@@ -1012,21 +1083,45 @@ class _Run:
         plan = row.plan
         inv = plan.invoice
         state = _ApplyState(current=inv, original_doc=inv.doc_number if inv is not None else plan.doc_number)
-        for action in plan.actions:
+        for index, action in enumerate(plan.actions):
             step = asyncio.ensure_future(self._execute(row, state, action))
             try:
                 ok = await asyncio.shield(step)
             except asyncio.CancelledError:
-                # Phase 4 step 3: the current action finishes, then this plan stops.
-                while not step.done():
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await asyncio.shield(step)
-                if not step.cancelled() and step.exception() is None and step.result() and action is plan.actions[-1]:
-                    self._finish_row(row)
+                # Phase 4 step 3: the current action finishes, then this plan stops — never between the two records
+                # of a notice (_settle_interrupted).
+                await _finish_shielded(step)
+                if not step.cancelled() and step.exception() is None and step.result():
+                    rest = plan.actions[index + 1:]
+                    if rest:
+                        await self._settle_interrupted(row, state, action, rest)
+                    else:
+                        self._finish_row(row)
                 raise
             if not ok:
                 return
         self._finish_row(row)
+
+    async def _settle_interrupted(self, row: _Row, state: _ApplyState, done: Action, rest: list[Action]) -> None:
+        """Ctrl+C stopped a NOTIFY plan after `done`. A notice is recorded twice — the `A` suffix and the VShip NOTIF
+        note (01 §1) — and the next run must not see one without the other:
+        - after the suffixing QBO update, before the e-mail: the D11 revert puts the DocNumber back, so the next run
+          sees the invoice under its old number (a lone suffix would make it send the first notice again as 'X AA');
+        - after the e-mail: the VShip note is still written, so the 7-day rule (01 §11) holds the next day.
+        A failing revert or note writes its 01 §14 entry (FAILED); otherwise the caller marks the plan INTERRUPTED."""
+        plan = row.plan
+        if isinstance(done, QboUpdate) and state.doc_changed and any(isinstance(a, QboSend) for a in rest):
+            revert = asyncio.ensure_future(self._revert(row, state))
+            await _finish_shielded(revert)
+            note = revert.result()
+            if state.doc_changed:                                           # the revert failed too
+                error = f"interrupted (Ctrl+C) before the e-mail was sent {note}"
+                self._apply_failure(row, texts.qb_processing_error_entry(plan.doc_number, error), error=error,
+                                    reason="interrupted before the e-mail was sent")
+            else:
+                plan.done.append(f"DocNumber reverted to {state.original_doc}")
+        elif isinstance(done, QboSend) and isinstance(rest[0], VShipComment):
+            await _finish_shielded(asyncio.ensure_future(self._execute(row, state, rest[0])))
 
     def _finish_row(self, row: _Row) -> None:
         plan = row.plan
@@ -1039,10 +1134,27 @@ class _Run:
         try:
             await self._perform(row, state, action)
         except Exception as exc:  # noqa: BLE001 - mapped to 01 §6.6
+            if isinstance(action, QboSend) and getattr(exc, "receipt", None) is not None:
+                self._sent_but_template_not_restored(row, action, exc)
+                return True
             await self._action_failed(row, state, action, exc)
             return False
         row.plan.done.append(_describe(action))
         return True
+
+    def _sent_but_template_not_restored(self, row: _Row, action: QboSend, exc: Exception) -> None:
+        """04b §6.2 step 3.5: the customer WAS e-mailed and only the template restore failed afterwards (the error
+        carries `.receipt`). The send counts as done: the ledger records the e-mail, the `A` suffix stays, and the
+        row goes on with its VShip note and ETA (01 §6.4 steps 5–6) — the note is what the 7-day rule reads the next
+        day (01 §11). Every other e-mail of this run is blocked and the restore instructions are printed (04b §6.1)."""
+        plan = row.plan
+        self._ledger(row, EMAILED, _receipt_detail(getattr(exc, "receipt", None)))
+        plan.done.append(_describe(action))
+        warning = f"e-mail sent, but the QuickBooks e-mail template could not be restored afterwards: {exc}"
+        plan.warnings.append(warning)
+        log.error("#%s: %s", plan.doc_number, warning)
+        if isinstance(exc, EmailPathUnavailableError):
+            self._email_path_failed(exc, before_apply=False)
 
     async def _perform(self, row: _Row, state: _ApplyState, action: Action) -> None:
         plan = row.plan
@@ -1090,16 +1202,16 @@ class _Run:
             self._ledger(row, "qbo_update", {"eta": action.eta, "error": error}, ok=False)
             entry = texts.qb_processing_error_entry(doc, error)
         elif isinstance(action, QboSend):
-            receipt = getattr(exc, "receipt", None)
-            if receipt is not None:
-                # The customer WAS e-mailed (the template restore failed afterwards, 04b §6.2): record the e-mail
-                # so the same-day guard knows it, and keep the suffixed DocNumber that records the notice.
-                self._ledger(row, EMAILED, _receipt_detail(receipt))
-            else:
-                self._ledger(row, EMAILED, {"subject": action.subject, "error": error}, ok=False)
-                if state.doc_changed:
-                    # D11: the original left the DocNumber changed when the send failed; put it back.
-                    error = f"{error} {await self._revert(row, state)}"
+            # (A send error carrying `.receipt` — the e-mail went out — never gets here: _execute counts it as sent.)
+            detail: dict[str, Any] = {"subject": action.subject, "error": error}
+            if getattr(exc, "outcome_unknown", False):
+                # 04b §7: the request may have reached the provider, so the e-mail may have gone out. The ledger's
+                # same-day guard counts this record, so a re-run today needs --force (the D11 revert still runs).
+                detail["outcome_unknown"] = True
+            self._ledger(row, EMAILED, detail, ok=False)
+            if state.doc_changed:
+                # D11: the original left the DocNumber changed when the send failed; put it back.
+                error = f"{error} {await self._revert(row, state)}"
             entry = texts.qb_processing_error_entry(doc, error)
         elif isinstance(action, VShipComment) or isinstance(exc, _VShipIdUnavailable):
             name = "vship_comment" if isinstance(action, VShipComment) else "vship_patch_eta"
@@ -1268,6 +1380,11 @@ class _Run:
             self._print("E-mails to send by hand (--no-email):" if self.no_email else "E-mails:")
             for row in notify:
                 self._print("  " + self._notify_line(row))
+        redirect = (self.settings.qbo.email_redirect_to or "").strip() if self.settings.qbo is not None else ""
+        if redirect and any(isinstance(a, QboSend) for r in self.rows for a in r.plan.actions):
+            # 04b §10 step 4: a shadow run changes only the recipients; the notice is still recorded as sent.
+            self._print(f"QB_EMAIL_REDIRECT_TO is set: e-mails go to {redirect} instead of the customers, but the "
+                        "QuickBooks and VShip changes are REAL (ETA, DocNumber suffix, NOTIF notes, ledger).")
         updates = [r for r in self.rows if r.plan.route in (Route.PAID_UPDATE, Route.FUTURE_UPDATE)]
         if updates:
             self._print("ETA updates:")
@@ -1333,7 +1450,7 @@ class _Run:
 
     def _finish(self) -> RunSummary:
         """Phase 5: Done line (01 §13), per-route table, timings, paths; the report is rewritten."""
-        code = EXIT_EMAIL_BLOCKED if self.email_blocked else EXIT_OK
+        code = EXIT_EMAIL_BLOCKED if self.email_blocked or self.restore_error is not None else EXIT_OK
         if self.report_stage == "plan":
             self.report_stage = "final"
         counts = self._counts()
@@ -1349,9 +1466,10 @@ class _Run:
         if self.output_errors:
             noun = "entry" if self.output_errors == 1 else "entries"
             self._print(f"{self.output_errors} output {noun} could not be written - see the log.")
-        if self.email_blocked:
+        if self.email_blocked or self.restore_error is not None:
             self._print(_BANNER)
-            self._print(f"The invoice e-mail path failed in this run: {self.email_error}")
+            if self.email_blocked:
+                self._print(f"The invoice e-mail path failed in this run: {self.email_error}")
             if self.restore_error is not None:
                 self._print("The QuickBooks invoice e-mail template must be restored by hand:")
                 self._print(str(self.restore_error))
@@ -1362,12 +1480,20 @@ class _Run:
             self._write_report(final_code=code)
         except OSError as exc:
             log.error("Could not rewrite the run report: %s", exc)
+            self._print(f"The run report could not be rewritten ({exc}); it may still show the plan.")
         self._print(f"Report: {self.summary.report_csv} | {self.summary.report_json}")
         if self.summary.log_file is not None:
             self._print(f"Log: {self.summary.log_file}")
         if self.summary.to_email_csv is not None:
             self._print(f"E-mails to send by hand: {self.summary.to_email_csv}")
         return self._summarize(code)
+
+
+async def _finish_shielded(fut: asyncio.Future[Any]) -> None:
+    """Wait for `fut` although this task is being cancelled (Phase 4 step 3: a started write always finishes)."""
+    while not fut.done():
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.shield(fut)
 
 
 def _blocked_copy(exc: BaseException) -> EmailPathUnavailableError:
@@ -1390,9 +1516,9 @@ async def run(settings: Settings, input_csv: Path, *, dry_run: bool = False, ass
     (0 done, 2 configuration/authentication/lock, 3 aborted, 4 e-mail path failed).
 
     Test/CLI hooks (additions to the 10 §4 signature): `services` replaces build_services() (the caller then
-    owns and closes them); `input_fn` answers the confirmation prompt (default `input`, called through
-    asyncio.to_thread); `is_tty` says whether stdin is interactive; `getpass_fn` reads a pasted MSC token;
-    `out` receives the console summary (default sys.stdout); `log_file` is only reported.
+    owns and closes them); `input_fn` answers the confirmation prompt (default `input`, read through
+    prompt.read_line, so one Ctrl+C ends the process); `is_tty` says whether stdin is interactive; `getpass_fn`
+    reads a pasted MSC token; `out` receives the console summary (default sys.stdout); `log_file` is only reported.
     A Ctrl+C (task cancellation) during apply marks unfinished plans INTERRUPTED, rewrites the report and
     re-raises the cancellation after the clients are closed.
     """

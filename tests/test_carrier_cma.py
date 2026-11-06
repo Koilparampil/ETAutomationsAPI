@@ -26,6 +26,7 @@ import respx
 
 from eta_automations.carriers import cma, dcsa
 from eta_automations.carriers.base import CarrierClient
+from eta_automations.carriers.router import CarrierRouter
 from eta_automations.carriers.cma import (
     HINT_401,
     HINT_403,
@@ -47,6 +48,7 @@ from eta_automations.config import CmaSettings
 from eta_automations.errors import CarrierLookupError, ConfigError, NoEtaError
 from eta_automations.models import Carrier, EtaResult
 from eta_automations.token_store import TokenStore
+from fakes import UnwritableTokenStore
 
 FIX = Path(__file__).parent / "fixtures" / "cma"
 BASE = "https://apis.cma-cgm.net/operation/trackandtrace/v1"
@@ -802,6 +804,117 @@ async def test_429_blocks_concurrent_calls(cma_settings: Callable[..., CmaSettin
     assert 2.0 < clock.sleeps[0] <= 2.5 and 0.0 < clock.sleeps[1] <= clock.sleeps[0]
 
 
+def with_latency(responses: Iterable[httpx.Response], stamps: list[float], clock: ScaledTime,
+                 latency_s: float = 0.2) -> Callable[[httpx.Request], Any]:
+    """respx side effect with a network round trip of `latency_s` virtual seconds (a real HTTP call yields to the
+    event loop; a plain respx answer does not). Records the virtual time each request leaves the client."""
+    queue = list(responses)
+
+    async def side_effect(request: httpx.Request) -> httpx.Response:
+        stamps.append(clock.monotonic())
+        await asyncio.sleep(latency_s / clock.scale)
+        return queue.pop(0)
+
+    return side_effect
+
+
+# ── review fix CRA-02: calls queued at the semaphore or in the limiter re-check the gate ──
+async def test_429_holds_back_a_call_queued_at_the_semaphore(cma_settings: Callable[..., CmaSettings],
+                                                             token_store: TokenStore) -> None:
+    """CRA-02 (08 §4.6 'Never retry earlier', §6.5): with one CMA slot, B waits at the semaphore while A is in
+    flight. A's 429 closes the gate, so B, once it has the slot, waits for the gate instead of sending at once."""
+    clock = ScaledTime(scale=50.0)
+    a_calls: list[float] = []
+    b_calls: list[float] = []
+    async with respx.mock(assert_all_called=True) as router:
+        router.get(ref_url("NAM1111111")).mock(side_effect=with_latency([
+            json_response(429, "error_429.json", headers={"Retry-After": "2"}), events_response()], a_calls, clock))
+        router.get(ref_url("NAM2222222")).mock(side_effect=with_latency([events_response()], b_calls, clock))
+        async with open_client(cma_settings(CMA_MAX_CONCURRENCY="1"), token_store, clock) as client:
+            await asyncio.gather(client.get_eta("NAM1111111"), client.get_eta("NAM2222222"))
+    gate_opens = a_calls[0] + 0.2 + 2.5          # A's 429 arrives after the round trip; 2 s + 0.5 s margin
+    assert b_calls[0] >= gate_opens - 1e-3
+    assert a_calls[1] >= gate_opens - 1e-3
+
+
+async def test_429_holds_back_every_queued_call_with_the_default_slots(cma_settings: Callable[..., CmaSettings],
+                                                                       token_store: TokenStore) -> None:
+    """CRA-02 with CMA_MAX_CONCURRENCY=2 and three bookings: C is queued behind A and B and must not be sent inside
+    the window A's 429 announced."""
+    clock = ScaledTime(scale=50.0)
+    calls: dict[str, list[float]] = {"A": [], "B": [], "C": []}
+    async with respx.mock(assert_all_called=True) as router:
+        router.get(ref_url("NAM1111111")).mock(side_effect=with_latency([
+            json_response(429, "error_429.json", headers={"Retry-After": "2"}), events_response()], calls["A"], clock))
+        router.get(ref_url("NAM2222222")).mock(side_effect=with_latency([events_response()], calls["B"], clock, 1.0))
+        router.get(ref_url("NAM3333333")).mock(side_effect=with_latency([events_response()], calls["C"], clock))
+        async with open_client(cma_settings(), token_store, clock) as client:
+            await asyncio.gather(*(client.get_eta(b) for b in ("NAM1111111", "NAM2222222", "NAM3333333")))
+    assert calls["C"][0] >= calls["A"][0] + 0.2 + 2.5 - 1e-3
+
+
+async def test_429_holds_back_a_call_waiting_in_the_proactive_limiter(cma_settings: Callable[..., CmaSettings],
+                                                                      token_store: TokenStore) -> None:
+    """CRA-02 with CMA_MAX_CALLS_PER_MINUTE=1: B waits in the limiter until t≈60 while A's 429 (Retry-After 100)
+    closes the gate until t≈100.7; B must not be sent before the gate opens."""
+    clock = ScaledTime(scale=400.0)
+    calls: dict[str, list[float]] = {"A": [], "B": []}
+    async with respx.mock(assert_all_called=True) as router:
+        router.get(ref_url("NAM1111111")).mock(side_effect=with_latency([
+            json_response(429, "error_429.json", headers={"Retry-After": "100"}), events_response()], calls["A"],
+            clock))
+        router.get(ref_url("NAM2222222")).mock(side_effect=with_latency([events_response()], calls["B"], clock))
+        async with open_client(cma_settings(CMA_MAX_CALLS_PER_MINUTE="1"), token_store, clock) as client:
+            await asyncio.gather(client.get_eta("NAM1111111"), client.get_eta("NAM2222222"))
+    gate_opens = calls["A"][0] + 0.2 + 100.5
+    assert calls["B"][0] >= gate_opens - 0.5 and calls["A"][1] >= gate_opens - 0.5
+
+
+async def test_every_request_still_takes_a_limiter_slot(cma_settings: Callable[..., CmaSettings],
+                                                        token_store: TokenStore) -> None:
+    """CRA-02: _send takes the first limiter slot itself (to re-check the gate after the wait); the retry after a 401
+    still takes its own, so CMA_MAX_CALLS_PER_MINUTE counts every request."""
+    settings = cma_settings(CMA_API_KEY=None, CMA_CLIENT_ID=CLIENT_ID, CMA_CLIENT_SECRET=CLIENT_SECRET,
+                            CMA_MAX_CALLS_PER_MINUTE="10")
+    async with respx.mock(assert_all_called=True) as router:
+        router.post(TOKEN_URL).mock(side_effect=[token_response("tok-1"), token_response("tok-2")])
+        get_route = router.get(ref_url("NAM1234567")).mock(side_effect=[
+            json_response(401, "error_401.json"), events_response()])
+        async with open_client(settings, token_store) as client:
+            await client.get_eta("NAM1234567")
+            limiter = client._limiter
+            assert limiter is not None and limiter.acquired == get_route.call_count == 2
+
+
+# ── review fix CRA-03: a 429 over the cap closes the gate too ──
+async def test_429_over_cap_closes_the_gate_for_later_lookups(cma_settings: Callable[..., CmaSettings],
+                                                              token_store: TokenStore) -> None:
+    """CRA-03 (08 §4.6, §6.5; 10 §6): a 429 announcing more than CMA_MAX_RETRY_AFTER_S fails its lookup AND closes
+    the shared gate. Later lookups fail at once with the very same text (so the circuit breaker can trip) and send
+    nothing; once the rest of the window fits the cap they wait it out, and after it they call CMA again."""
+    clock = FakeTime()
+    async with respx.mock(assert_all_called=False) as router:
+        a = router.get(ref_url("NAM1111111")).mock(
+            return_value=json_response(429, "error_429.json", headers={"Retry-After": "300"}))
+        later = {ref: router.get(ref_url(ref)).mock(return_value=events_response())
+                 for ref in ("NAM2222222", "NAM3333333", "NAM4444444", "NAM5555555")}
+        async with open_client(cma_settings(), token_store, clock) as client:
+            texts = []
+            for ref in ("NAM1111111", "NAM2222222", "NAM3333333"):
+                with pytest.raises(CarrierLookupError) as info:
+                    await client.get_eta(ref)
+                texts.append(str(info.value))
+            assert later["NAM2222222"].call_count == 0 and later["NAM3333333"].call_count == 0
+            assert clock.sleeps == []
+            clock.now += 200.0                        # 100.5 s of the window left: within the 120 s cap → wait
+            await client.get_eta("NAM4444444")
+            assert later["NAM4444444"].call_count == 1 and clock.sleeps == [pytest.approx(100.5)]
+            await client.get_eta("NAM5555555")         # after the window: sent at once
+    assert a.call_count == 1 and later["NAM5555555"].call_count == 1 and len(clock.sleeps) == 1
+    assert texts == [("CMA rate limit reached (HTTP 429, retry after 300s; CMA_MAX_RETRY_AFTER_S=120). Try again "
+                      "later or ask CMA to raise your application's quota.")] * 3
+
+
 async def test_5xx_retried_then_success(cma_settings: Callable[..., CmaSettings], token_store: TokenStore) -> None:
     clock = FakeTime()
     async with respx.mock(assert_all_called=True) as router:
@@ -942,6 +1055,72 @@ async def test_oauth_401_refreshes_once(oauth_settings: CmaSettings, tmp_path: P
     assert token_route.call_count == 2 and get_route.call_count == 2
 
 
+# ── review fix CRA-05: tokens.json that cannot be written ──
+async def test_oauth_token_kept_in_memory_when_tokens_json_cannot_be_written(
+        oauth_settings: CmaSettings, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """CRA-05 (03 §5 boundary rule): a token that cannot be saved is kept for this process — two bookings, one token
+    POST, one WARNING (never the token) — instead of an OSError escaping get_eta()."""
+    caplog.set_level(logging.WARNING, logger="eta")
+    store = UnwritableTokenStore(tmp_path / "tokens.json")
+    bookings = ["NAM1234567", "NAM1234568"]
+    async with respx.mock(assert_all_called=True) as router:
+        token_route = router.post(TOKEN_URL).mock(return_value=token_response())
+        for b in bookings:
+            router.get(ref_url(b)).mock(return_value=events_response())
+        async with open_client(oauth_settings, store) as client:
+            results = [await client.get_eta(b) for b in bookings]
+    assert [r.booking for r in results] == bookings and token_route.call_count == 1
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and "tokens.json" in r.getMessage()]
+    assert len(warned) == 1 and ACCESS_TOKEN not in warned[0]
+
+
+async def test_oauth_rejected_token_that_cannot_be_removed_is_not_reused(oauth_settings: CmaSettings,
+                                                                         tmp_path: Path) -> None:
+    """CRA-05: after a 401 the rejected token cannot be deleted from tokens.json; it is not read back, so the retry
+    uses a new token."""
+    path = tmp_path / "tokens.json"
+    TokenStore(path).put("cma", {"access_token": "rejected-cma-token", "expires_at": time.time() + 3000,
+                                 "token_type": "Bearer", "scope": SCOPE})
+    async with respx.mock(assert_all_called=True) as router:
+        token_route = router.post(TOKEN_URL).mock(return_value=token_response("tok-new"))
+        get_route = router.get(ref_url("NAM1234567")).mock(side_effect=[
+            json_response(401, "error_401.json"), events_response()])
+        async with open_client(oauth_settings, UnwritableTokenStore(path)) as client:
+            result = await client.get_eta("NAM1234567")
+    assert result.eta == datetime(2026, 11, 10, 14, 0) and token_route.call_count == 1
+    assert [c.request.headers["Authorization"] for c in get_route.calls] == ["Bearer rejected-cma-token",
+                                                                             "Bearer tok-new"]
+
+
+# ── review fix CRA-04: OAuth token failures name no booking, so the circuit breaker can trip ──
+async def test_rejected_oauth_credentials_trip_the_circuit_breaker(oauth_settings: CmaSettings,
+                                                                   token_store: TokenStore) -> None:
+    """CRA-04 (10 §6: rejected credentials give the same text for every booking): a token endpoint answering 401
+    invalid_client fails every CMA lookup with one text, so after ETA_CARRIER_FAILURE_LIMIT rows the breaker stops
+    the rest without calling the token endpoint again."""
+    clock = FakeTime()
+    http = httpx.AsyncClient()
+    client = CmaClient(oauth_settings, token_store, http=http, sleep=clock.sleep, monotonic=clock.monotonic)
+    router = CarrierRouter(providers={Carrier.CMA: "native"}, native={Carrier.CMA: client}, failure_limit=5)
+    errors: list[str] = []
+    try:
+        async with respx.mock(assert_all_called=False) as mock:
+            token = mock.post(TOKEN_URL).mock(return_value=httpx.Response(
+                401, json={"error": "invalid_client", "error_description": "Bad client credentials"}))
+            for i in range(8):
+                _carrier, ref, lookup = router.route(f"NAM100000{i}")
+                with pytest.raises(CarrierLookupError) as info:
+                    await lookup.get_eta(ref)
+                errors.append(str(info.value))
+    finally:
+        await router.aclose()
+        await http.aclose()
+    assert token.call_count == 5
+    assert errors[:5] == ["cma: OAuth token request rejected: invalid_client: Bad client credentials"] * 5
+    assert all("lookups aborted after 5 identical consecutive failures" in e for e in errors[5:])
+    assert CLIENT_SECRET not in " ".join(errors)
+
+
 async def test_cached_fresh_token_reused_and_skew_60s(oauth_settings: CmaSettings, token_store: TokenStore) -> None:
     now = 1_800_000_000.0
     async with respx.mock(assert_all_called=False) as router:
@@ -992,8 +1171,8 @@ async def test_oauth_token_errors_map_through_the_boundary_rule(oauth_settings: 
         async with open_client(oauth_settings, token_store) as client:
             with pytest.raises(CarrierLookupError) as info:
                 await client.get_eta("NAM1234567")
-    assert str(info.value) == ("Failed to get CMA tracking info for NAM1234567: cma: OAuth token request rejected: "
-                               "invalid_client: Client authentication failed")
+    # CRA-04: the token endpoint's reason, without the booking (one text for every booking, 10 §6)
+    assert str(info.value) == "cma: OAuth token request rejected: invalid_client: Client authentication failed"
     assert token_route.call_count == 1 and get_route.call_count == 0
     assert CLIENT_SECRET not in str(info.value)
 
@@ -1003,8 +1182,8 @@ async def test_oauth_token_errors_map_through_the_boundary_rule(oauth_settings: 
         async with open_client(oauth_settings, token_store) as client:
             with pytest.raises(CarrierLookupError) as info:
                 await client.get_eta("NAM1234567")
-    assert str(info.value).startswith(
-        "Failed to get CMA tracking info for NAM1234567: cma: OAuth token request failed: cma: unexpected HTTP 503")
+    assert str(info.value).startswith("cma: OAuth token request failed: cma: unexpected HTTP 503")
+    assert "NAM1234567" not in str(info.value)
     assert token_route.call_count == 4   # the default 03 §6 retries apply to the token call (08 §5)
 
     async with respx.mock(assert_all_called=False) as router:

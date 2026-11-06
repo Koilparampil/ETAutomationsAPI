@@ -55,6 +55,7 @@ from .errors import AuthError, ConfigError, EtaAutomationError, RunLockedError, 
 from .http import new_async_client
 from .logging_setup import configure_logging, log_file_path, redact
 from .models import Carrier
+from .prompt import pending_reader
 from .qbo import email as qbo_email
 from .qbo.auth import QboAuth, run_authorization_code_flow
 from .qbo.client import VALUE_KEYS, EtaFieldSpec, InvoiceSnapshot, QboClient, split_addresses
@@ -369,9 +370,16 @@ def _configure_console() -> None:
 
 
 def _pause_before_exit() -> None:
-    """11 §5 step 2: wait for ENTER so a double-clicked console window stays open (EOF ignored)."""
+    """11 §5 step 2: wait for ENTER so a double-clicked console window stays open (EOF ignored). After a Ctrl+C at
+    the [y/N] prompt its reader thread still waits for a line (prompt.read_line): that ENTER closes the window, so
+    the user is not asked twice."""
     with contextlib.suppress(EOFError, KeyboardInterrupt, OSError, RuntimeError):
-        input(PAUSE_PROMPT)
+        reader = pending_reader()
+        if reader is None:
+            input(PAUSE_PROMPT)
+        else:
+            print(PAUSE_PROMPT, end="", flush=True)
+            reader.join()
 
 
 def _with_settings(args: argparse.Namespace) -> int:
@@ -1571,8 +1579,15 @@ async def _qbo_prefs_roundtrip(ctx: _Probe) -> int:
              "QuickBooks.")
     first = out["steps"][0] if out["steps"] else None
     if first is not None and first["name"] == "unchanged" and not first["ok"]:
-        _out("  Step 1 failed, so no probe subject was written."
-             + (" Check the settings listed above in QuickBooks." if first.get("differences") else ""))
+        _out("  Step 1 failed, so no probe subject was written.")
+        if first.get("differences"):
+            # The unchanged full write-back itself changed company settings; this probe cannot undo that.
+            _out("  The probe cannot undo the write-back: restore them by hand in QuickBooks (Settings → Account and "
+                 "settings):")
+            for change in first["differences"]:
+                before = change["before"]
+                fix = "remove it" if before == "<absent>" else f"set it back to {_one_line(before, 100)}"
+                _out(f"    {change['path']}: {fix}")
     if not passed:
         _out("  template_swap is not safe for this company — use QB_EMAIL_STRATEGY=graph (or smtp), 04b §8.")
     _saved(ctx.save("qbo", f"prefs-roundtrip_{s.realm_id}", out))
@@ -1879,8 +1894,11 @@ def _cmd_qbo_auth(args: argparse.Namespace, settings: Settings, log_file: Path |
     token_store = _token_store(settings)
 
     async def flow() -> int:
-        await run_authorization_code_flow(qbo_settings, token_store, listen=args.listen, port=args.port,
-                                          input_fn=input, open_browser=not args.no_browser)
+        # 03 §14: qbo-auth writes tokens.json and .env, so it holds the run lock (RunLockedError → exit 2 in
+        # _guard). A run started earlier would otherwise write its older refresh token over the new one.
+        with run_lock(settings.run.state_dir):
+            await run_authorization_code_flow(qbo_settings, token_store, listen=args.listen, port=args.port,
+                                              input_fn=input, open_browser=not args.no_browser)
         return EXIT_OK
 
     return asyncio.run(_guard("qbo-auth", flow))

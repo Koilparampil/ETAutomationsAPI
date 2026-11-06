@@ -20,6 +20,7 @@ The program was built in stages, following `BUILD_PROMPT.md`:
 Test status at the end of the build (Python 3.13.18):
 `python -m pytest -q` → **1553 passed, 8 skipped**. The skips are the 7 opt-in live smoke tests (12 §5,
 `ETA_LIVE_TESTS=1`) and one MSC test that needs a German locale. The tests never touch the network.
+After the review fixes of area A (section B): **1622 passed, 8 skipped**, also with `-W error::RuntimeWarning`.
 
 Precedence used for conflicts (from `BUILD_PROMPT.md`): 03-foundations > 01-business-rules > 04–09 (their test
 tables are acceptance tests) > 10-pipeline > the rest. Where a genuine contradiction remained, the safer behaviour
@@ -74,7 +75,10 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
   every other value is stripped. A leading `Bearer ` is removed from `MSC_ACCESS_TOKEN`.
 - `load_settings(env_file=None, *, env=None)`: with `env`, only that mapping is read. Otherwise
   `load_dotenv(path, override=True, encoding="utf-8-sig")` (tolerates a BOM written by Windows editors). An
-  explicit `--env-file` that does not exist raises `Settings file not found: …`; a missing `./.env` is fine.
+  explicit `--env-file` that does not exist raises `Settings file not found: …`; a missing `./.env` is fine. A
+  `.env` that is not UTF-8 (Windows "ANSI" with an accented character, UTF-16 from PowerShell `>`) or cannot be read
+  raises `ConfigError` (`Cannot read the settings file … save it as UTF-8 text`, exit 2) instead of crashing with a
+  traceback (review fix CLI-02).
 - `load_settings` logs the obsolete-variable notice itself: the exact 04 §3 INFO line for `QB` / `QB_HEADLESS`,
   one DEBUG line for `MSC_PASSWORD`, `LOGIN_URL`, `HOME_PAGE`.
 - `EmailSettings` is built only for `graph` and `smtp`; with `template_swap`, `Settings.email` is `None` and
@@ -93,6 +97,15 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
   (e.g. `has_token: True`). Masking a few non-secrets (e.g. `token_type`) is accepted. Integration change:
   `bearer` directly after `/` (QuickBooks' `/oauth2/v1/tokens/bearer` URL) is no longer treated as an auth
   scheme; real credentials are still masked.
+- **Linear-time redaction** (review fix FND-02): three `redact()` patterns backtracked quadratically on long
+  whitespace runs or a long `a.a.a…` run, and whole response bodies were redacted before being cut to 500
+  characters, so one hostile error body could stall the event loop for minutes. Whitespace runs next to another run
+  that can also match whitespace are now possessive (same matches), the URL scheme is bounded to 32 characters, and
+  `redact_excerpt()` redacts only the first 4096 characters of a body (moving the cut back to whitespace so a
+  `user:password@` URL is never split) for `ServiceError` excerpts and the VShip/aggregator excerpts. 03 §6 step 4
+  reads `redact(resp.text)[:500]`; the excerpt can now be shorter when a long masked value precedes the cut.
+- `jwt_exp()` also returns `None` for an integer `exp` too large for a float (03 §7 "None on any decoding error";
+  review fix FND-03).
 - `new_async_client`: a float timeout means read/write/pool with connect `min(10, t)`; default headers are
   merged case-insensitively.
 - `run_lock` creates the state folder (mode 0700). Only lock contention becomes `RunLockedError`; other
@@ -150,6 +163,13 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
   WARNING (`os.environ` is updated anyway); an existing UTF-8 BOM in `.env` is kept.
 - Any token-response field whose name contains `expir` (besides `expires_in` and `x_refresh_token_expires_in`)
   is stored under `response_expiry_fields` in the `qbo` token entry; only key names are logged.
+- **tokens.json write failures** (review fix QBO-06): 04 §5.2 step 4 persists the new entry first, but a failing
+  `token_store.put()` (full disk, permissions, a Windows sharing violation) used to raise and drop a rotated refresh
+  token, which 04 §5.1 says must always be kept. The new entry is now kept in memory first; a failed put is an
+  ERROR naming the file (never a token) and the refresh still succeeds and still writes the token back to `.env`,
+  which the next run picks up as a pasted token (seeding step 4). If `.env` cannot be written either, a second
+  ERROR says to reconnect with `eta qbo-auth` should the old token be rejected. `invalidate()` treats a failed put
+  the same way (the access token is dropped in memory).
 
 ### QuickBooks: `qbo/client.py` (04 §6–§8)
 
@@ -183,6 +203,15 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
   with 3 attempts).
 - If the restore fails **after a successful send**, `TemplateRestoreError` is raised as the spec requires, but
   its message says the e-mail WAS sent and it carries `.receipt` (see `pipeline.py`).
+- If the restore fails **after a failed send**, the read-only step-4 inference still runs (review fix QBO-02; the
+  literal step order of 04b §6.2 would skip it). A fresh `DeliveryTime` gives the same "WAS sent" error with the
+  inferred receipt (`outcome_inferred=True`), so the row counts as e-mailed; otherwise the message adds what the
+  inference found ("not sent" or "outcome unknown") and `outcome_unknown` follows it. The inference GET runs after
+  the template lock is released.
+- **Cancellation during the restore** (review fix QBO-07): a cancelled send still waits for its shielded restore
+  before it leaves the template lock (04b §6.2 step 3), so a queued send never sees the swapped subject and never
+  marks the e-mailer broken by mistake; then the cancellation goes on. A cancelled send whose restore fails stays a
+  cancellation (the failure is already in `broken`, which refuses every later send, and in the log).
 - If a stale-object (5010) re-read during the swap shows that a person changed the template subject, that subject
   is kept, restored and written to the recovery file (step 3.1 rule) instead of being overwritten.
 - If the Preferences POST answer lacks `InvoiceMessage`, the stored subject is checked with a GET. A missing or
@@ -190,8 +219,10 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
   `TemplateRestoreError`; failing to write the recovery file raises `EmailPathUnavailableError`. A cancellation
   during the swap write or the send still triggers the restore.
 - Send failures are classified: a failure at the token endpoint, a 400/401/403/404/429/503 or a connect error
-  means "not sent, safe to retry"; timeouts, 500/502/504 and unreadable answers mean "outcome unknown". `/send`
-  is never POSTed twice.
+  means "not sent, safe to retry"; timeouts, 500/502/504 and unreadable answers mean "outcome unknown" and set
+  `outcome_unknown=True` on the raised `InvoiceSendError` (also for Graph/SMTP, and for a `TemplateRestoreError`
+  after such a send), so the pipeline's ledger treats the invoice as possibly e-mailed. `/send` is never POSTed
+  twice.
 - `graph`/`smtp`: **safer:** in redirect (shadow) mode `mark_sent` is skipped, since the customer was not
   e-mailed. A Graph 403/404 on `sendMail` and rejected Graph or SMTP credentials raise
   `EmailPathUnavailableError` (every send would fail the same way). If the pay link cannot be read, the e-mail
@@ -208,7 +239,18 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
 - **Safer paging:** an absolute `Next-Page` link is followed only when scheme, host **and port** match the API
   base (the spec checks the host only, which would let plain http or another port receive the token). A
   `?query` link is resolved against the current URL rather than sent as a cursor. A malformed link stops paging
-  with a WARNING. This holds for `dcsa.fetch_event_pages` and the Maersk client.
+  with a WARNING. This holds for `dcsa.fetch_event_pages` and the Maersk client. In `dcsa.fetch_event_pages`
+  (review fix MSK-03) every link but a bare cursor is resolved first and the same-origin check applies to the
+  result, so a network-path link (`//other-host/…`, which resolves to another host) is never followed either; a
+  link httpx cannot parse (`httpx.InvalidURL`, which is no `httpx.HTTPError`) stops paging with a WARNING.
+- **Token cache writes are best effort** (review fixes MSK-05, CRA-05): the MSC, Maersk and CMA token providers
+  write tokens.json through `carriers.base.TokenCache`. A failed write (full disk, permissions, a Windows sharing
+  violation) logs one WARNING per provider and never fails a lookup (03 §5): a new token is kept in memory for the
+  run, and after a failed delete the token left in the file (one the carrier rejected) is not read back. The file
+  stays the source of truth while it can be written. `MscBridgeAuth.invalidate()` latches the "expired or was
+  rejected" error before it touches the file. `eta msc-token` still fails when it cannot save the token (it must
+  not print "stored" falsely); a token pasted at a run's pre-flight prompt is used even if it cannot be saved.
+  As a safety net, the MSC, Maersk and CMA lookup boundaries also map `OSError` to `CarrierLookupError`.
 - Probe output: `error` is set only when the integration itself failed (auth, HTTP error, unusable shape, no
   events); "no ETA" or an untracked aggregator booking leaves it empty. Probes add diagnostic keys beyond the
   spec (request summaries with `next_page_value`, `elapsed_ms`, `explain` lines, etc.). Maersk and aggregator
@@ -247,6 +289,14 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
 - `normalize_token` also accepts a pasted `Authorization:` prefix; a bare `Bearer` counts as empty
   (`ConfigError`). Messages never echo the value. An `MSC_ACCESS_TOKEN` containing whitespace is ignored with one
   WARNING, then the no-token error (a `ConfigError` there would break the 03 §5 boundary rule).
+- **Header values must be ASCII** (review fix MSK-01): `normalize_token` also refuses invisible or non-ASCII
+  characters (a zero-width space, a BOM, `…` from a shortened copy, control characters) with `ConfigError`, so
+  `eta msc-token` and the pre-flight no longer accept a token that can never be sent. A `UnicodeError` raised while
+  httpx builds the headers (a non-ASCII `MSC_USER_EMAIL`, `MSC_USER_ROLES`, subscription key, or a token stored
+  before this check) is latched as one `CarrierLookupError` naming the setting (latch kind `config`, which a newly
+  pasted token does not clear) or asking to paste the token again (kind `auth`), instead of escaping `get_eta()`.
+  `MSC_USER_EMAIL` is not validated at start-up because it defaults to `VSHIP_USER_NAME`, which must not stop runs
+  without MSC rows.
 - `token_status()` adds `expired` (`seconds_left` can be negative); in api mode also `sandbox` and `has_key`.
 - `MscSelection` has two extra defaulted fields (`event_date`, `event`); positional construction still works.
   The transshipment source date uses a fixed English month map (locale-independent).
@@ -260,6 +310,14 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
   would mask whole).
 - **Safer:** when the API timeline has no containers, the customs rule still runs on the all-events timeline (a
   hold means no e-mail).
+- **Implausible dates** (review fixes MSK-02, MSK-04; 06 §7.2 only asks to skip unreadable dates): like
+  `dcsa.parse_events` (09 §A.3.4 step 3), api mode skips an event whose `eventDateTime` year is outside
+  `dcsa.PLAUSIBLE_YEARS` (2000–2100, e.g. the .NET sentinels `0001-01-01` / `9999-12-31T23:59:59.9999999`), so a
+  sentinel can neither sort ahead of the real ETA nor become it. `parse_msc_date()` rejects such years with
+  `ValueError("implausible MSC date …")`: in mymsc mode a matched event with such a date is the parity `NoEtaError`
+  ("unreadable date"); the `finalEta` rescue ignores one too. `OverflowError` (date arithmetic, e.g. the
+  transshipment `+7 days`) is mapped to `CarrierLookupError` by `_wrap_parse`, and the log-only multi-container
+  check treats it as "no date" (`n/a`), so it never fails the lookup.
 
 ### `carriers/maersk.py` (07)
 
@@ -279,9 +337,21 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
 
 ### `carriers/cma.py` (08)
 
-- Token-endpoint failures raise `CmaTokenError` (an `AuthError`), re-raised unchanged so the message keeps the
-  token endpoint's reason (e.g. a network error) instead of the misleading "CMA rejected the API credentials";
-  `HINT_401` is used only after a second API 401.
+- Token-endpoint failures raise `CmaTokenError` (an `AuthError`); `_send` turns it into a `CarrierLookupError`
+  that keeps the token endpoint's reason (e.g. a network error) instead of the misleading "CMA rejected the API
+  credentials" of 08 §6.4's pseudocode; `HINT_401` is used only after a second API 401. The text names no booking
+  (review fix CRA-04; it used to be wrapped as `Failed to get CMA tracking info for {ref}: …`), so rejected OAuth
+  credentials or an unreachable token host give one text for every booking and the circuit breaker (10 §6) stops
+  the remaining CMA lookups instead of each row calling the token endpoint again.
+- **Shared 429 gate** (review fixes CRA-02, CRA-03; 08 §4.6 "Never retry earlier", §6.5): `_send` re-checks the
+  gate after it got a semaphore slot and again after the proactive limiter's wait, right before sending; a closed
+  gate sends the call back to wait at the gate outside the slot (the §6.4 pseudocode checks only before the
+  semaphore, so calls queued there or in the limiter were sent inside the window). `_send` takes the limiter's slot
+  itself; request_with_auth's retry after a 401 still takes its own. Every 429 closes the gate, including one over
+  `CMA_MAX_RETRY_AFTER_S` or the fourth of a call (the pseudocode raised before closing it). A later call that
+  would have to wait longer than `CMA_MAX_RETRY_AFTER_S` (+ 0.5 s) fails at once, without sending, with the
+  rate-limit text of the 429 that closed the gate — the same text for every booking, so the breaker can trip; once
+  the rest of the window fits the cap, calls wait it out as before.
 - Other 4xx without DCSA `errors[]`:
   `CMA tracking API rejected the request for {ref} (HTTP {status}): {ServiceError text}`. DCSA errors are read
   from the redacted, ≤ 500-character body excerpt (complete objects are recovered from a cut-off excerpt).
@@ -314,6 +384,14 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
   not fresh.
 - Movements outside the plausible years are skipped; a `NOT_ASSIGNED` container makes its events vessel-level;
   container numbers are de-duplicated; a missing status uses the forward-compatible readiness rule.
+- **Dry runs never register** (review fix CRA-01): 10 Phase 2 calls `router.prepare()` in every run, so a dry run
+  used to register untracked bookings (1 credit each) and write `aggregator_tracking.json`, against 11 §2 ("nothing
+  is written anywhere"). `build_services(read_only=True)` now calls `build_router(read_only=True)`, which switches
+  the aggregator client to read-only (`AggregatorClient.set_read_only()`; the 03 §9 factory signature of
+  `aggregator.build_client()` is unchanged). The read-only client never creates (the booking fails in the plan
+  with `… is not registered with <provider> yet — a real run registers it (1 credit)`) and its `TrackingState`
+  keeps changes in memory only. Free lookups (state file, list, details) still run, so tracked bookings keep
+  their ETAs.
 - `probe()` never registers a booking or writes the state file; without a carrier it derives one from the 01 §4
   patterns (the router stays the authority).
 - MSC via the aggregator (09 §B.7.6, a documented deviation) applies no MSC customs-hold or transshipment rule.
@@ -337,11 +415,15 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
 
 - Text output files use the platform newline (like the original's `open(..., "a")`). `Send2Bindu.csv` uses
   `csv.writer`'s `\r\n` and gets a BOM only when new or empty. Report and `ToEmail` CSVs are UTF-8 with a BOM;
-  the report is rewritten atomically.
+  the report is rewritten atomically, JSON first and each file on its own (review fix XCT-04): a CSV that cannot
+  be replaced because it is open (Excel on Windows) is written as `run_<run_id>_<stage>.csv` and that path is
+  printed; a declined run whose report cannot be rewritten still exits 3.
 - An `OSError` while appending an entry (e.g. `Send2Bindu.csv` open in Excel) does not stop the run: the entry
   text is logged at ERROR and counted in the final summary.
 - `Ledger(path, *, clock=None, enabled=True)`. `emailed_on()` returns the latest successful `emailed` event of
-  that day (its `detail.sent_at`, else the record time). Records are redacted, written as one line with flush
+  that day (its `detail.sent_at`, else the record time); a failed one with `detail.outcome_unknown=true` counts too
+  (at its record time). A record is never glued to a torn last line: when the file does not end with a newline,
+  one is written first, so only the torn line is lost. Records are redacted, written as one line with flush
   and fsync; ledger write failures are logged, never fatal. Actions: `qbo_update`, `emailed`,
   `qbo_revert_doc_number`, `vship_comment`, `vship_patch_eta`; failures are recorded with `ok=false`.
 
@@ -354,10 +436,27 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
 - **Safer:** any exception from the e-mail preflight (`prepare_for_sending`) blocks e-mail for the whole run, not
   only `EmailPathUnavailableError`. NOTIFY rows then fail with `QB Invoice Processing Error, No Email Sent` and the
   run exits 4 (a dry run stays 0).
-- **Restore failure after a sent e-mail** (spec tension between 04b and P34): a `TemplateRestoreError` carrying
-  `.receipt` means the e-mail went out. The row is still FAILED with the QB entry (P34), but there is no D11
-  revert (the `A` suffix records the notice that was sent), and the e-mail is recorded in the ledger as
-  `emailed` so the same-day guard blocks a resend. Without a receipt, the D11 revert runs.
+- **Restore failure after a sent e-mail** (spec tension between 04b and P34; review fix RUL-03): a
+  `TemplateRestoreError` carrying `.receipt` means the e-mail went out. The send counts as done: no D11 revert (the
+  `A` suffix records the notice), the e-mail is recorded in the ledger as `emailed`, and the row goes on with its
+  VShip note and ETA (01 §6.4 steps 5–6) — the note is what the 7-day rule reads the next day (01 §11), so the
+  customer is not e-mailed the first notice again. The row gets no `No Email Sent` entry (a later VShip failure
+  writes its own 01 §6.6 entry) and keeps a warning in the report; every other e-mail of the run is blocked, the
+  restore instructions are printed and the run exits 4. Without a receipt (P34), the row fails and the D11 revert
+  runs.
+- **Send with an unknown outcome** (review fix RUL-02): 04b marks a failed send whose request may have reached the
+  provider (timeout, 5xx, lost answer, and a restore failure after such a send) with
+  `InvoiceSendError.outcome_unknown`. The row is reported like any failed send (D11 revert, `QB Invoice Processing
+  Error, No Email Sent` with the "outcome unknown — check … before re-sending" text), but its `emailed` ledger
+  record (`ok=false`) carries `detail.outcome_unknown=true`, which the same-day guard counts: a re-run the same day
+  skips the invoice until `--force`. 10 §9 counts only successful sends; 04b §7 makes the ledger the guard against
+  a second e-mail, which is the safer reading.
+- **Template repair in every real run** (review fix XCT-03): 10 Phase 3 step 2 repairs a QuickBooks invoice e-mail
+  subject left swapped by a crashed template_swap run only through the template_swap preflight, i.e. only in runs
+  that send through template_swap. Every other real run (nothing to e-mail, `--no-email`, `graph`/`smtp`) now calls
+  `QboClient.recover_email_template()` (an addition: the `--restore-template` recovery) before the prompt when the
+  recovery file exists; a dry run only warns. A failure prints the manual instructions (before the prompt and in the
+  final summary) and the run exits 4. `QboClient.aclose()` does the same recovery as a fallback (10 §3).
 - A NOTIFY row already running when the e-mail path breaks does not send; it gets the stored error and its
   DocNumber is reverted (D11). NOTIFY rows not yet started fail without any action.
 - An unresolved VShip booking id fails the VShip steps with `Note Write Error, QB Invoice Processing Successful`
@@ -368,18 +467,40 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
   plans become INTERRUPTED, the summary is printed, the report is rewritten with stage `interrupted`, the clients
   are closed and the lock released, then the cancellation propagates (the CLI exits 3). During planning or review
   it prints `Interrupted before anything was changed.`.
+- **Ctrl+C never splits a notice** (review fix RUL-01; 01 §1 records a notice twice, as the `A` suffix and the VShip
+  NOTIF note). A NOTIFY plan interrupted after its suffixing QBO update and before the e-mail gets the D11 revert
+  (report: `… ; DocNumber reverted to X`), so the next run sees the invoice under its old number; one interrupted
+  after the e-mail still writes its VShip note (not the ETA patch), so the 7-day rule holds the next day. Both
+  steps are shielded like the current action. A failing revert writes `QB Invoice Processing Error, No Email Sent`
+  (`interrupted (Ctrl+C) before the e-mail was sent (could not revert …)`), a failing note its `Note Write Error`
+  entry; such rows are FAILED instead of INTERRUPTED. Sends already queued behind the template_swap lock are
+  started actions and still finish (10 Phase 4 step 3), each followed by its note.
 - The input path check (exists, file, `.csv`) runs first, before the lock and any network call (exit 2); a
   non-UTF-8 input or a CSV error is exit 2 as well.
 - `Loaded {n} booking(s) from file.` counts rows after the D2 header skip and before `--only`/`--limit`; an extra
   INFO line reports the selection. The report lists the selected rows. D3 duplicates are found before
   `--only`/`--limit`.
+- **One notice per booking per run** (review fix XCT-01): rows of one booking (`X` and `X A`, a normal input pair)
+  are decided from one read of its VShip notes (D18), while the original re-read the notes for each row and so saw
+  the note an earlier row had just posted. After 2c the plans are replayed in input order, keyed by VShip booking
+  id (else base booking): each NOTIFY plan adds its planned note, and a later NOTIFY plan of the same booking is
+  decided again with those notes — `NOTIF #2` → Ben, a `NOTIF #1` of today → `Done in the last week`. `ARRIVING ON`
+  notes are no notices, so pre-arrival pairs are still both e-mailed (O4).
 - The NOTIFY guards (no BillEmail, DocNumber too long, ledger same-day guard) run in Phase 2c, before the
   `--no-email` transformation, so they also apply to `--no-email` runs.
+- **Redirect guard** (review fix QBO-03): with `template_swap` on the production company and
+  `QB_EMAIL_REDIRECT_TO` set, a NOTIFY row whose BillEmail is not the redirect address fails in Phase 2c with
+  `QB Invoice Processing Error, No Email Sent` and the 04b §3 text (`qbo.email.redirect_refusal()`, the same rule
+  `TemplateSwapEmailer.send()` applies in its step 1). 04b checks it only at the send, i.e. after the QuickBooks
+  update had suffixed the DocNumber, which then needed the D11 revert (contrary to 04 §6.6 and 10 Phase 4). The
+  guard is skipped in `--no-email` runs, which send nothing.
 - `--no-email`: a `ToEmail_<run_id>.csv` row is written when the row's QuickBooks update succeeds (where the
   e-mail would have been sent); `to`/`cc` joined with `, `; header and BOM on creation; never in a dry run.
 - Phase 0 step 6 (integration change): a login that fails with a network error, or with an HTTP status other
   than 400/401/403, gets a network/retry hint instead of "Run `eta qbo-auth`"; credential failures keep the
   credential hint. Exit code 2 either way.
+- With `QB_EMAIL_REDIRECT_TO` set and e-mails to send, the plan summary adds one line saying that QuickBooks and
+  VShip changes are real (04b §10 step 4 shadow-run caveat; review fix CLI-01).
 - `run()` takes extra keyword hooks (`clock`, `services`, `input_fn`, `is_tty`, `getpass_fn`, `out`,
   `log_file`), all defaulted.
 
@@ -401,7 +522,9 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
   stops after step 1 if the unchanged write-back is not lossless, writes the 04b §6.2 recovery file before
   changing the subject (so a crash is repaired by `--restore-template` or the next run), always attempts the
   restore, and refuses when a recovery file already exists. Diffs ignore only top-level `SyncToken` and
-  `MetaData`.
+  `MetaData`. A lossy step-1 write-back (full mode writes the whole company Preferences object) cannot be undone
+  by the probe: it lists each changed setting with the value to set back by hand (review fix CLI-03), and the
+  README says to run it on the sandbox first.
 - **Safer:** `--send-test` bypasses the verification gate for the probe only. On production it refuses unless
   `BillEmail` is exactly `QB_TEST_SEND_TO` and `BillEmailCc`/`Bcc` hold no other address (stricter than 04b §10).
   The subject's mm/dd is the invoice's ETA, or today. A failed send records nothing.
@@ -425,7 +548,9 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
   first); less than 10 minutes left only prints a note. The token is never printed.
 - `eta qbo-fields` exits 1 when the ETA field is not on the invoice, or when its shape comes only from `.env`.
 - `eta qbo-auth` without `QB_REALM_ID` builds the QuickBooks settings itself (`realm_id=""`). `--listen` with
-  production keys only logs a warning.
+  production keys only logs a warning. It holds the run lock for the whole flow (03 §14; review fix FND-01): a run
+  started before it would otherwise write its older refresh token over the new authorization on its next 401 or
+  refresh. With the lock taken it exits 2 (`Another ETAutomationsAPI run is in progress`).
 - `eta eta` uses the real router (memo, breaker, providers) with a fixed clock; a configured aggregator may
   register new bookings (09 §B.11 step 3). Bookings are routed as typed (stripped, no suffix removal).
   `--json` prints `{run_now, cutoff, window_business_days, results: [...]}`. Exit 0 even when lookups fail.
@@ -448,16 +573,65 @@ Stages A–F and G changed only their own files. The integration stage made thes
 
 Stage H (documentation) changed no code: it wrote only `README.md`, `.env.example` and this file.
 
+**Review fixes, area A** (rules, pipeline, foundations, config, CLI, docs). Each fix has a regression test that
+failed before the fix; the reasons are in section A under the module named.
+
+| Finding | Change | Files |
+|---|---|---|
+| RUL-01 | Ctrl+C never leaves a notice half-recorded (suffix reverted, or NOTIF note written) | `pipeline.py` |
+| RUL-02 / XCT-05 | "Outcome unknown" sends are flagged and block a same-day resend (ledger) | `errors.py`, `qbo/email.py`, `pipeline.py`, `ledger.py` |
+| RUL-03 / QBO-04 | A send followed by a failed template restore counts as sent; the VShip steps still run | `pipeline.py` |
+| RUL-04 | One Ctrl+C at the `[y/N]` / paste-back prompt ends the process | new `prompt.py`, `pipeline.py`, `qbo/auth.py`, `cli.py` |
+| XCT-01 | One notice per booking per run when `X` and `X A` are both in the file | `pipeline.py` |
+| XCT-03 | Every real run repairs a template left swapped by a crashed run | `qbo/client.py`, `pipeline.py` |
+| XCT-04 | A report open in Excel no longer crashes a declined run or hides the final report | `outputs.py`, `pipeline.py` |
+| XCT-06 | The ledger starts a new line after a torn last line | `ledger.py` |
+| CRA-01 | A dry run never registers aggregator bookings nor writes their state file | `carriers/aggregator.py`, `carriers/router.py`, `pipeline.py` |
+| FND-01 | `eta qbo-auth` holds the run lock (03 §14) | `cli.py` |
+| FND-02 | Linear-time redaction; error excerpts are redacted from a bounded prefix | `logging_setup.py`, `http.py`, `errors.py`, `vship/client.py`, `carriers/aggregator.py` |
+| FND-03 | `jwt_exp()` returns `None` for an `exp` too large for a float | `token_store.py` |
+| CLI-01 | Shadow-mode (`QB_EMAIL_REDIRECT_TO`) caveat in the plan summary and the docs | `pipeline.py`, `README.md`, `.env.example` |
+| CLI-02 | A `.env` that is not UTF-8 is a configuration error (exit 2) | `config.py`, `README.md`, `.env.example` |
+| CLI-03 | `--prefs-roundtrip` lists the settings to restore by hand after a lossy write-back | `cli.py`, `README.md` |
+| CLI-05 | Tests for the Cc/Bcc and missing `QB_TEST_SEND_TO` refusals of `--send-test` | `tests/test_cli.py` |
+
+The tests are in the matching `tests/test_*.py` files, plus the new `tests/test_prompt.py` and `tests/test_docs.py`;
+`tests/fakes.py` gained `FakeQbo.recover_email_template()`.
+
+**Review fixes, area B** (QuickBooks, carriers). Each fix has a regression test that failed before the fix; the
+reasons are in section A under the module named.
+
+| Finding | Change | Files |
+|---|---|---|
+| QBO-02 | A failed restore after a failed `/send` still runs the read-only inference (a delivery QuickBooks shows counts as sent) | `qbo/email.py` |
+| QBO-03 | `QB_EMAIL_REDIRECT_TO` refused by template_swap fails the row while planning, before any QuickBooks change | `qbo/email.py`, `pipeline.py`, `README.md` |
+| QBO-06 | A rotated QuickBooks refresh token survives a failed tokens.json write (memory + `.env`) | `qbo/auth.py` |
+| QBO-07 | A cancelled send keeps the template lock until its restore ends; a cancellation stays a cancellation | `qbo/email.py` |
+| MSK-01 | Non-ASCII tokens are refused when pasted; non-ASCII header values give one latched lookup error | `carriers/msc.py`, `README.md` |
+| MSK-02 / MSK-04 | MSC sentinel dates (years outside 2000–2100) are never an ETA; date overflow never escapes `get_eta()` | `carriers/msc.py` |
+| MSK-03 | `dcsa.fetch_event_pages` never follows `//other-host/…`; a malformed link stops paging | `carriers/dcsa.py` |
+| MSK-05 / CRA-05 | Carrier token-cache writes are best effort (`carriers.base.TokenCache`); MSC latches a 401 first | `carriers/base.py`, `carriers/msc.py`, `carriers/maersk.py`, `carriers/cma.py` |
+| CRA-02 | CMA calls queued at the semaphore or in the limiter re-check the 429 gate before sending | `carriers/cma.py` |
+| CRA-03 | Every CMA 429 closes the gate; a window over the cap fails later lookups at once with one text | `carriers/cma.py`, `README.md` |
+| CRA-04 | CMA OAuth token failures name no booking, so the circuit breaker trips | `carriers/cma.py`, `README.md` |
+
+QBO-01 (an outcome-unknown send must block a same-day resend) and QBO-05 (a template left swapped is repaired by
+runs without e-mails) needed no change: area A's fixes RUL-02 and XCT-03 already implement them, and their tests
+cover the findings' test plans. `tests/fakes.py` gained `UnwritableTokenStore`.
+
 ---
 
 ## C. Open issues
 
-1. **Ctrl+C at two prompts needs Enter as well.** The `[y/N]` confirmation (`pipeline.py`, Phase 3) and the
-   paste-back prompt of `eta qbo-auth` (`qbo/auth.py`) read input with `await asyncio.to_thread(input, …)`, as
-   10 §4 specifies. After Ctrl+C the worker thread stays blocked in `input()`, so the process exits only after
-   Enter or a second Ctrl+C. Nothing has been written at that point. A fix would read the line directly (nothing
-   else runs concurrently there) but departs from the spec, so it was left. The CLI's own prompts (write-probe
-   confirmations, the send-test question, `eta msc-token`) are interruptible at once.
+1. **Ctrl+C at the two asyncio prompts (resolved by review fix RUL-04; Windows unverified).** The `[y/N]`
+   confirmation (`pipeline.py`, Phase 3) and the paste-back prompt of `eta qbo-auth` (`qbo/auth.py`) used
+   `await asyncio.to_thread(input, …)` as 10 §4 specifies; that executor thread is joined at exit, so one Ctrl+C
+   did not end the process (a third ended it with a traceback). Both now use `prompt.read_line()`: on a POSIX
+   terminal the event loop watches stdin (`add_reader` + `os.read`) and no thread is involved (a daemon thread in
+   `input()` would hang glibc's `exit()`, which locks the stdin `FILE` that `fgets()` holds); elsewhere — the
+   Windows console, an injected input function — `input_fn` runs in a daemon thread. One Ctrl+C now exits with
+   code 3 (tested on Linux through a pseudo-terminal). On Windows the console path is not verified; the
+   double-click pause reuses a reader left waiting by Ctrl+C, so one Enter closes the window.
 2. **Python 3.12 is only partly verified.** All source and test files parse under Python 3.12.3, but no 3.12
    virtual environment could be created in the build container. Running the suite with 3.12 against the 3.13
    environment's packages gave 1444 passed and 109 failed; every failure inspected was numpy's 3.13 binary
@@ -476,7 +650,9 @@ Stage H (documentation) changed no code: it wrote only `README.md`, `.env.exampl
    the booking number, so repeated identical causes do not trip the breaker; each booking fails on its own. The
    usual "not approved" case fails earlier at the token call (HTTP 400) with an identical text, which does trip
    it. CMA's per-booking texts (404, `[]`, wrong booking, no ETA) never trip it, which is intended; its 401/403
-   hints and the 429-over-cap text do.
+   hints, its OAuth token failures (review fix CRA-04) and its rate-limit text after an over-cap 429 (review fix
+   CRA-03: later lookups repeat the text of the 429 that closed the gate) do. CMA 5xx and network failures still
+   name the booking (08 §6.7), so they do not.
 7. **Notes for maintainers:** `DcsaEvent` is a frozen dataclass holding a dict, so it is not hashable (do not
    put events in sets or use them as dict keys). `dcsa.fetch_event_pages` sends only bearer tokens (the spec
    signature has no header hook), so CMA keeps its own `_send` with the `KeyId` header and its 429 gate.

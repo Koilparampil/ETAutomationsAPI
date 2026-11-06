@@ -51,6 +51,7 @@ from eta_automations.config import MscSettings
 from eta_automations.errors import CarrierLookupError, ConfigError, CustomsHoldError, NoEtaError
 from eta_automations.models import Carrier
 from eta_automations.token_store import TokenStore
+from fakes import UnwritableTokenStore
 
 NOW = datetime(2026, 11, 5, 9, 30)
 BOOKING = "EBKG12345678"
@@ -471,6 +472,77 @@ def test_18_parse_wall_datetime_rejects(text: Any) -> None:
         parse_wall_datetime(text)
 
 
+# ── review fix MSK-02 / MSK-04: implausible (sentinel) dates, as 09 §A.3.4 step 3 ──
+def test_api_event_with_a_sentinel_date_never_becomes_the_eta(fx: Callable[[str], Any]) -> None:
+    """MSK-02: an event dated with a .NET sentinel (9999-12-31T23:59:59.9999999, 0001-01-01) is skipped, as in
+    dcsa.parse_events: it can neither sort ahead of the real ETA nor become the ETA itself."""
+    payload = fx("api_in_transit")
+    sentinel = json.loads(json.dumps(payload[0]))                       # a copy of its 'Estimated Time of Arrival'
+    sentinel["eventDateTime"] = "9999-12-31T23:59:59.9999999"
+    assert eta_from_api([*payload, sentinel], booking=BOOKING, now=NOW).eta == datetime(2026, 11, 12)
+    loaded = api_event("EQUIPMENT", "LOAD", "ACT", TRANSSHIPMENT_EVENT, "9999-12-31T23:59:59.9999999", "ESVLC",
+                       "MSCU1111111")
+    assert eta_from_api([*payload, loaded], booking=BOOKING, now=NOW).eta == datetime(2026, 11, 12)
+    payload[0]["eventDateTime"] = "0001-01-01T00:00:00Z"                 # the only ETA event is a sentinel
+    with pytest.raises(NoEtaError):
+        eta_from_api(payload, booking=BOOKING, now=NOW)
+
+
+@pytest.mark.parametrize("text", ["31 Dec 9999", "01 Jan 0001", "31 Dec 1999", "01 Jan 2101"])
+def test_parse_msc_date_rejects_years_outside_2000_2100(text: str) -> None:
+    """MSK-02: a matched event with such a date is the parity NoEtaError ('unreadable date'), never a year-1 or
+    year-9999 ETA (which would e-mail 'ARRIVED ON 01/01' or overflow the transshipment rule)."""
+    with pytest.raises(ValueError):
+        parse_msc_date(text)
+    body = gql_payload(gql_container("MSCU1111111", [gql_event(ETA_EVENT, text, "GH")]))
+    with pytest.raises(NoEtaError, match="unreadable date"):
+        eta_from_graphql(body, booking=BOOKING, now=NOW)
+
+
+def test_parse_msc_date_accepts_the_plausible_bounds() -> None:
+    assert parse_msc_date("01 Jan 2000") == datetime(2000, 1, 1)
+    assert parse_msc_date("31 Dec 2100") == datetime(2100, 12, 31)
+
+
+@pytest.mark.parametrize("final_eta", ["9999-12-31T23:59:59.9999999", "0001-01-01T00:00:00Z", "31 Dec 9999"])
+def test_rescue_never_uses_a_sentinel_final_eta(final_eta: str) -> None:
+    """MSK-02: the opt-in finalEta rescue (06 §7.5) skips a sentinel like every other MSC date."""
+    body = gql_payload(gql_container("MSCU1111111", [gql_event("Export Loaded on Vessel", "20 Oct 2026", "ES")],
+                                      final_eta=final_eta))
+    with pytest.raises(NoEtaError):
+        eta_from_graphql(body, booking=BOOKING, now=NOW, rescue=True)
+    usable = gql_payload(gql_container("MSCU1111111", [gql_event("Export Loaded on Vessel", "20 Oct 2026", "ES")],
+                                       final_eta="2026-11-12T06:00:00Z"))
+    assert eta_from_graphql(usable, booking=BOOKING, now=NOW, rescue=True).eta == datetime(2026, 11, 12)
+
+
+def test_a_sentinel_transshipment_on_another_container_never_fails_the_lookup() -> None:
+    """MSK-04: the multi-container check is log only (06 §7.1 step 9). A 'Full Transshipment Loaded' on 31 Dec 9999
+    on a second container (loaded + 7 days overflows) used to raise OverflowError and fail the whole booking."""
+    c0 = gql_container("MSCU1111111", [gql_event(ETA_EVENT, "12 Nov 2026", "GH")])
+    c1 = gql_container("MSCU2222222", [gql_event(TRANSSHIPMENT_EVENT, "31 Dec 9999", "ES")])
+    assert eta_from_graphql(gql_payload(c0, c1), booking=BOOKING, now=NOW).eta == datetime(2026, 11, 12)
+
+
+async def test_a_sentinel_transshipment_date_is_a_lookup_outcome_not_a_crash(
+        token_store: TokenStore, mock: respx.MockRouter, make_client: Callable[..., MscClient]) -> None:
+    """MSK-04 (03 §5 boundary rule): get_eta() raises NoEtaError or CarrierLookupError, never OverflowError."""
+    seed_token(token_store)
+    body = gql_payload(gql_container("MSCU1111111", [gql_event(TRANSSHIPMENT_EVENT, "31 Dec 9999", "ES")]))
+    mock.post(GQL_URL).mock(return_value=httpx.Response(200, json=body))
+    with pytest.raises((NoEtaError, CarrierLookupError)):
+        await make_client().get_eta(BOOKING)
+
+
+def test_wrap_parse_maps_date_overflow_to_a_lookup_error() -> None:
+    """MSK-04, defence in depth: date arithmetic that overflows is a payload problem, not a crash (03 §5)."""
+    def overflow() -> Any:
+        return datetime(9999, 12, 31) + (datetime(2026, 1, 8) - datetime(2026, 1, 1))
+
+    with pytest.raises(CarrierLookupError, match="Unexpected MSC payload shape"):
+        msc._wrap_parse(overflow, BOOKING)
+
+
 # ═════════════════════════════ Rescue-only fallbacks (06 §7.5) ═════════════════════════════
 def test_rescue_mymsc_final_eta(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.WARNING, logger="eta.carrier.msc")
@@ -655,6 +727,117 @@ def test_24_manual_token_validation_and_claims(token_store: TokenStore) -> None:
     for leaked in ("sub", "0f9c-user-id", "email", "clerk@example.com", "Jane Clerk", "jclerk", jwt):
         assert leaked not in dumped
     assert token_store.get("msc")["access_token"] == jwt
+
+
+# ── review fix MSK-01: invisible / non-ASCII characters in a header value ──
+@pytest.mark.parametrize("bad", ["Bearer abc\u200bdef.ghi.jkl", "\ufeffeyJhbGciOi.abc.def", "eyJhbGciOi\u2026",
+                                 "abc\x01def.ghi.jkl"])
+def test_token_with_invisible_or_non_ascii_characters_is_refused(token_store: TokenStore, bad: str) -> None:
+    """MSK-01: a zero-width space, a BOM, a '…' from a shortened copy or a control character is refused when the
+    token is pasted (an HTTP header can carry only ASCII), and the error never echoes the value."""
+    with pytest.raises(ConfigError) as exc:
+        msc.normalize_token(bad)
+    assert "abc" not in str(exc.value) and "eyJ" not in str(exc.value)
+    auth = MscBridgeAuth(BRIDGE, token_store, epoch=lambda: EPOCH)
+    with pytest.raises(ConfigError):
+        auth.set_manual_token(bad)
+    assert token_store.get("msc") is None
+
+
+async def test_non_ascii_msc_user_email_fails_every_lookup_fast(token_store: TokenStore, mock: respx.MockRouter,
+                                                                make_client: Callable[..., MscClient]) -> None:
+    """MSK-01 (03 §5 boundary rule): a non-ASCII MSC_USER_EMAIL cannot be sent as a header. Every MSC lookup fails
+    with one latched CarrierLookupError naming the setting — never a UnicodeEncodeError — and nothing is sent."""
+    seed_token(token_store)
+    route = mock.post(GQL_URL).mock(return_value=httpx.Response(200, json={}))
+    client = make_client(MscSettings(mode="mymsc", user_email="m\u00fcller@example.com"))
+    with pytest.raises(CarrierLookupError) as first:
+        await client.get_eta(BOOKING)
+    assert "MSC_USER_EMAIL" in str(first.value) and "m\u00fcller" not in str(first.value)
+    with pytest.raises(CarrierLookupError) as second:
+        await client.get_eta("EBKG00000002")
+    assert str(second.value) == str(first.value) and route.call_count == 0
+    assert client.latched == str(first.value)
+
+
+async def test_stored_token_with_a_non_ascii_character_fails_fast_and_a_new_token_clears_it(
+        token_store: TokenStore, mock: respx.MockRouter, make_client: Callable[..., MscClient]) -> None:
+    """MSK-01: a token stored before this check (or edited by hand) gives a latched 'paste it again' error; pasting a
+    clean token clears that latch."""
+    seed_token(token_store, "abc\u200bdef.ghi.jkl")
+    route = mock.post(GQL_URL).mock(return_value=httpx.Response(200, json={}))
+    client = make_client()
+    with pytest.raises(CarrierLookupError, match="eta msc-token") as first:
+        await client.get_eta(BOOKING)
+    assert "abc" not in str(first.value) and route.call_count == 0
+    client.set_manual_token(TOKEN)
+    assert client.latched is None
+
+
+# ── review fix MSK-05: tokens.json that cannot be written ──
+async def test_rejected_token_is_latched_although_tokens_json_cannot_be_written(
+        state_dir: Path, mock: respx.MockRouter) -> None:
+    """MSK-05 (03 §5, MSC-D8): a 401 latches 'expired or was rejected' even when the rejected token cannot be removed
+    from tokens.json; later bookings fail fast with the same text and send nothing."""
+    path = state_dir / "tokens.json"
+    seed_token(TokenStore(path))
+    route = mock.post(GQL_URL).mock(return_value=httpx.Response(
+        401, text="Something went wrong!!! Authentication failed.", headers={"Content-Type": "text/plain"}))
+    client = MscClient(BRIDGE, UnwritableTokenStore(path), clock=FixedClock(NOW), epoch=lambda: EPOCH)
+    try:
+        for booking in (BOOKING, "EBKG00000002", "EBKG00000003"):
+            with pytest.raises(CarrierLookupError) as info:
+                await client.get_eta(booking)
+            assert str(info.value) == TOKEN_REJECTED_MESSAGE
+    finally:
+        await client.aclose()
+    assert route.call_count == 1
+
+
+async def test_env_token_is_used_although_tokens_json_cannot_be_written(
+        state_dir: Path, mock: respx.MockRouter, fx: Callable[[str], Any], caplog: pytest.LogCaptureFixture) -> None:
+    """MSK-05: MSC_ACCESS_TOKEN still works when it cannot be cached in tokens.json (one WARNING, never the token)."""
+    caplog.set_level(logging.WARNING, logger="eta")
+    route = mock.post(GQL_URL).mock(return_value=httpx.Response(200, json=fx("graphql_in_transit")))
+    settings = MscSettings(mode="mymsc", user_email="ops@example.com", manual_token=TOKEN)
+    client = MscClient(settings, UnwritableTokenStore(state_dir / "tokens.json"), clock=FixedClock(NOW),
+                       epoch=lambda: EPOCH)
+    try:
+        for booking in (BOOKING, "EBKG00000002"):
+            assert (await client.get_eta(booking)).eta == datetime(2026, 11, 12)
+    finally:
+        await client.aclose()
+    assert route.call_count == 2
+    assert all(call.request.headers["Authorization"] == f"Bearer {TOKEN}" for call in route.calls)
+    warned = [m for m in warnings_of(caplog) if "tokens.json" in m]
+    assert len(warned) == 1 and TOKEN not in warned[0]
+
+
+async def test_token_pasted_at_the_run_prompt_is_used_although_tokens_json_cannot_be_written(
+        state_dir: Path, mock: respx.MockRouter, fx: Callable[[str], Any]) -> None:
+    """MSK-05: the run's pre-flight paste (MscClient.set_manual_token) keeps the token in memory when it cannot be
+    saved; `eta msc-token` (store_manual_token) still fails loudly, so it never claims a token was stored."""
+    store = UnwritableTokenStore(state_dir / "tokens.json")
+    route = mock.post(GQL_URL).mock(return_value=httpx.Response(200, json=fx("graphql_in_transit")))
+    client = MscClient(BRIDGE, store, clock=FixedClock(NOW), epoch=lambda: EPOCH)
+    try:
+        status = client.set_manual_token(f"Bearer {TOKEN}")
+        assert status["has_token"] is True
+        assert (await client.get_eta(BOOKING)).eta == datetime(2026, 11, 12)
+    finally:
+        await client.aclose()
+    assert route.calls.last.request.headers["Authorization"] == f"Bearer {TOKEN}"
+    with pytest.raises(OSError):
+        msc.store_manual_token(BRIDGE, store, TOKEN, epoch=lambda: EPOCH)
+
+
+async def test_non_ascii_subscription_key_fails_fast(token_store: TokenStore, mock: respx.MockRouter,
+                                                     make_client: Callable[..., MscClient]) -> None:
+    route = mock.get(API_EVENTS).mock(return_value=httpx.Response(200, json=[]))
+    client = make_client(MscSettings(mode="api", api_base_url=API_BASE, api_key="key\u2026"))
+    with pytest.raises(CarrierLookupError, match="MSC_API_SUBSCRIPTION_KEY"):
+        await client.get_eta(BOOKING)
+    assert route.call_count == 0
 
 
 async def test_25_concurrency_is_bounded(mock: respx.MockRouter, make_client: Callable[..., MscClient],

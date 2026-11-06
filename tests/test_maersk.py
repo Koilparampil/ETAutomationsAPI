@@ -38,6 +38,7 @@ from eta_automations.config import MaerskSettings
 from eta_automations.errors import AuthError, CarrierLookupError, NoEtaError
 from eta_automations.models import Carrier
 from eta_automations.token_store import TokenStore
+from fakes import UnwritableTokenStore
 
 FIX = Path(__file__).parent / "fixtures" / "maersk"
 BASE_URL = "https://api.maersk.test"
@@ -419,6 +420,43 @@ async def test_401_twice_is_lookup_error(maersk_settings: Callable[..., MaerskSe
     assert token_route.call_count == 2 and events_route.call_count == 2
     assert str(info.value) == "Maersk API authentication failed: maersk: credentials/token rejected (HTTP 401)"
     assert isinstance(info.value.__cause__, AuthError)
+
+
+# ── review fix MSK-05: tokens.json that cannot be written ──
+async def test_token_kept_in_memory_when_tokens_json_cannot_be_written(
+        maersk_settings: Callable[..., MaerskSettings], tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """MSK-05 (03 §5 boundary rule): the token cache is best effort. A token that cannot be saved is kept for this
+    process, so two bookings need one token call; one WARNING, never the token."""
+    caplog.set_level(logging.WARNING, logger="eta")
+    store = UnwritableTokenStore(tmp_path / "tokens.json")
+    async with respx.mock(assert_all_called=True) as router:
+        token_route = router.post(TOKEN_URL).mock(return_value=token_response())
+        events_route = router.get(EVENTS_URL).mock(side_effect=[
+            events_response("events_in_transit.json"), events_response("events_arrived.json")])
+        async with open_client(maersk_settings(), store) as client:
+            first = await client.get_eta("210000001")
+            second = await client.get_eta("210000002")
+    assert token_route.call_count == 1 and events_route.call_count == 2
+    assert first.eta == datetime(2026, 11, 16) and second.eta == datetime(2026, 11, 2)
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and "tokens.json" in r.getMessage()]
+    assert len(warned) == 1 and ACCESS_TOKEN not in warned[0]
+
+
+async def test_rejected_token_that_cannot_be_removed_is_not_reused(maersk_settings: Callable[..., MaerskSettings],
+                                                                   tmp_path: Path) -> None:
+    """MSK-05: after a 401 the rejected token cannot be deleted from tokens.json; it is not read back, so the retry
+    uses a new token."""
+    path = tmp_path / "tokens.json"
+    seed_token(TokenStore(path), token="rejected-maersk-token", fingerprint=key_fingerprint(CLIENT_ID))
+    async with respx.mock(assert_all_called=True) as router:
+        token_route = router.post(TOKEN_URL).mock(return_value=token_response())
+        events_route = router.get(EVENTS_URL).mock(side_effect=[
+            httpx.Response(401, json=API_ERROR_401), events_response("events_in_transit.json")])
+        async with open_client(maersk_settings(), UnwritableTokenStore(path)) as client:
+            result = await client.get_eta("210000001")
+    assert result.eta == datetime(2026, 11, 16) and token_route.call_count == 1
+    assert [c.request.headers["Authorization"] for c in events_route.calls] == [
+        "Bearer rejected-maersk-token", f"Bearer {ACCESS_TOKEN}"]
 
 
 async def test_404_is_lookup_error(maersk_settings: Callable[..., MaerskSettings], store: TokenStore) -> None:

@@ -47,6 +47,7 @@ __all__ = [
     "FakeQbo",
     "FakeVShip",
     "FakeWorld",
+    "UnwritableTokenStore",
     "eta_result",
     "fake_build_services",
     "make_invoice",
@@ -57,6 +58,15 @@ WRITE_METHODS = frozenset({"qbo.update_invoice", "qbo.send_invoice", "vship.post
                            "vship.patch_expected_arrival"})
 
 Hook = Callable[..., Awaitable[None]]
+
+
+class UnwritableTokenStore(TokenStore):
+    """tokens.json that can be read but not written: a full disk, missing permissions, or a Windows sharing violation
+    while another program has the file open (review fixes MSK-05 / CRA-05). Seed it with a plain TokenStore on the
+    same path."""
+
+    def _write(self, data: Mapping[str, Any]) -> None:
+        raise PermissionError(13, "Permission denied", str(self.path))
 
 
 class CallLog(list[tuple[Any, ...]]):
@@ -140,7 +150,8 @@ def eta_result(carrier: Carrier, booking: str, eta: datetime, **kwargs: Any) -> 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 class FakeQbo:
     """QboClient fake: find_invoices_by_doc_numbers / ambiguous / update_invoice / prepare_for_sending /
-    send_invoice / aclose, plus `auth.get_token()`. Writes raise RuntimeError when read_only (dry run)."""
+    recover_email_template / send_invoice / aclose, plus `auth.get_token()`. Writes raise RuntimeError when
+    read_only (dry run)."""
 
     def __init__(self, calls: CallLog, *, clock: Clock, read_only: bool = False) -> None:
         self.calls = calls
@@ -151,6 +162,7 @@ class FakeQbo:
         self.ambiguous: dict[str, tuple[str, ...]] = {}
         self.lookup_error: BaseException | None = None
         self.prepare_error: BaseException | None = None
+        self.recover_error: BaseException | None = None          # recover_email_template() raises this
         self.update_errors: dict[str, BaseException] = {}       # invoice id -> error on every update
         self.revert_errors: dict[str, BaseException] = {}       # invoice id -> error when the DocNumber goes back
         self.send_errors: dict[str, BaseException] = {}         # invoice id -> error on send
@@ -200,6 +212,13 @@ class FakeQbo:
         self.calls.append(("qbo.prepare_for_sending", dry_run))
         if self.prepare_error is not None:
             raise self.prepare_error
+
+    async def recover_email_template(self) -> bool:
+        self._writable("qbo.recover_email_template")
+        self.calls.append(("qbo.recover_email_template",))
+        if self.recover_error is not None:
+            raise self.recover_error
+        return True
 
     async def send_invoice(self, inv: InvoiceSnapshot, *, subject: str) -> SendReceipt:
         self._writable("qbo.send_invoice")

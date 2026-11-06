@@ -20,12 +20,14 @@ __all__ = [
     "LOGGER_NAMES",
     "LOG_FORMAT",
     "MASK",
+    "REDACT_INPUT_MAX",
     "SECRET_KEY_RE",
     "RedactingFormatter",
     "configure_logging",
     "is_secret_key",
     "log_file_path",
     "redact",
+    "redact_excerpt",
     "reset_logging",
 ]
 
@@ -62,11 +64,15 @@ _QUOTED_PAIR_RE = re.compile(
     r"""(?P<sep>\s*[:=]\s*)"""
     r"""(?P<q2>["'])(?P<val>(?:\\[\s\S]?|(?!(?P=q2))[^\\])*)(?P<end>(?P=q2)|\Z)"""
 )
+# Every pattern below runs in linear time (FND-02): a whitespace run next to another run that can also match
+# whitespace is possessive (`*+`: the next token can never be whitespace, so the matches are unchanged), and the
+# URL scheme is bounded (an unbounded one rescanned a long "a.a.a…" run from every word start).
 # scheme://user:password@host
-_URL_USERINFO_RE = re.compile(r"(?i)\b(?P<scheme>[a-z][a-z0-9+.\-]*://)(?P<user>[^/\s:@]+):(?P<pw>[^/\s@]+)@")
+_URL_USERINFO_RE = re.compile(
+    r"(?i)\b(?P<scheme>[a-z][a-z0-9+.\-]{0,31}://)(?P<user>[^/\s:@]+):(?P<pw>[^/\s@]+)@")
 # Authorization: Basic xxx / authorization=Bearer xxx (any scheme word)
 _AUTH_SCHEME_RE = re.compile(
-    r"""(?i)(?P<pre>\b(?:proxy-)?authorization["']?\s*[:=]\s*["']?\s*)"""
+    r"""(?i)(?P<pre>\b(?:proxy-)?authorization["']?\s*+[:=]\s*+["']?\s*+)"""
     r"""(?P<scheme>basic|bearer|digest|negotiate|ntlm|token)\s+(?P<cred>[^\s"',;]+)"""
 )
 # 03 §11: "Bearer <x>" → "Bearer ***" anywhere in a string — except a URL path segment such as QuickBooks'
@@ -78,7 +84,11 @@ _KEY_VALUE_RE = re.compile(
     r"""(?<![A-Za-z0-9_.\-\[\]%])(?P<key>[A-Za-z0-9_.\-\[\]]{1,128})=(?P<val>"[^"]*"|'[^']*'|[^&#\s"',;)}<]*)"""
 )
 # Header-style lines: "Cookie: a=b; c=d"
-_HEADER_LINE_RE = re.compile(r"(?m)^(?P<key>[A-Za-z][A-Za-z0-9_-]{0,63})[ \t]*:[ \t]*(?P<val>[^\r\n]*[^\s])")
+_HEADER_LINE_RE = re.compile(r"(?m)^(?P<key>[A-Za-z][A-Za-z0-9_-]{0,63})[ \t]*+:[ \t]*+(?P<val>[^\r\n]*[^\s])")
+
+# redact_excerpt(): only this many characters of a response body are redacted for an error excerpt.
+REDACT_INPUT_MAX = 4096
+_EXCERPT_CUT_WINDOW = 512   # the cut moves back to the last whitespace within this many characters
 
 
 def is_secret_key(key: object) -> bool:
@@ -152,6 +162,19 @@ def redact(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(redact(v) for v in value)
     return value
+
+
+def redact_excerpt(text: str, limit: int = 500) -> str:
+    """`redact(text)[:limit]` for a response body of any size (03 §6 body_excerpt): only the first
+    REDACT_INPUT_MAX characters are redacted, so a huge or hostile body costs bounded work in the event-loop
+    thread (FND-02). The cut moves back to the last whitespace in its final 512 characters, so a token such as
+    `https://user:password@host` is never split; a value cut at the boundary is masked like any unterminated
+    value."""
+    if len(text) > REDACT_INPUT_MAX:
+        cut = text[:REDACT_INPUT_MAX]
+        space = max(cut.rfind(" "), cut.rfind("\t"), cut.rfind("\n"), cut.rfind("\r"))
+        text = cut[:space] if space >= REDACT_INPUT_MAX - _EXCERPT_CUT_WINDOW else cut
+    return _redact_text(text)[:limit]
 
 
 class RedactingFormatter(logging.Formatter):

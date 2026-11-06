@@ -38,6 +38,7 @@ from ..config import QboSettings
 from ..errors import AuthError, ConfigError
 from ..http import new_async_client, request
 from ..logging_setup import redact
+from ..prompt import read_line
 from ..token_store import TokenStore, is_fresh, jwt_exp
 
 __all__ = [
@@ -198,19 +199,20 @@ def _env_encoding(path: Path) -> str:
         return "utf-8"
 
 
-def write_env_value(env_file: Path | None, key: str, value: str) -> bool:
+def write_env_value(env_file: Path | None, key: str, value: str, *, stored: bool = True) -> bool:
     """dotenv.set_key(<env file>, key, value, quote_mode="never") and os.environ[key] = value.
 
     Only one key is rewritten, never the whole file (02 §5). A failure is a WARNING, not an error: the
-    TokenStore is the source of truth (04 §5.2 step 4). The value itself is never logged.
+    TokenStore is the source of truth (04 §5.2 step 4). The value itself is never logged. `stored=False` says
+    that tokens.json could not be written either, so the WARNING does not claim it holds the value.
     """
     path = _env_path(env_file)
     os.environ[key] = value
     try:
         set_key(path, key, value, quote_mode="never", encoding=_env_encoding(path))
     except (OSError, UnicodeError, ValueError) as exc:
-        log.warning("Could not write %s to %s (%s: %s); tokens.json still holds the current value",
-                    key, path, type(exc).__name__, redact(str(exc)))
+        log.warning("Could not write %s to %s (%s: %s)%s", key, path, type(exc).__name__, redact(str(exc)),
+                    "; tokens.json still holds the current value" if stored else "")
         return False
     return True
 
@@ -292,7 +294,7 @@ class QboAuth:
                 return
             entry["expires_at"] = 0.0
             if entry.get("access_token"):
-                self._store.put(STORE_KEY, dict(entry))
+                self._persist(entry, what="the dropped access token")
 
     async def force_refresh(self) -> None:
         """Refresh now, regardless of the cached access token (probes, `eta qbo-auth` checks)."""
@@ -345,14 +347,32 @@ class QboAuth:
             seed=self._env_rt or str(entry.get("refresh_token_seed") or ""),
             previous=entry, now=now,
         )
-        # 04 §5.2 step 4: persist to the TokenStore FIRST (atomic), then write back to .env
-        self._store.put(STORE_KEY, new_entry)
+        # 04 §5.2 step 4: persist to the TokenStore FIRST (atomic), then write back to .env. The new entry is kept in
+        # memory before that (review fix QBO-06): a failed tokens.json write must never drop a rotated refresh token
+        # (04 §5.1: the old one may stop working). This process goes on with it, and .env still receives it, which
+        # the next run picks up as a pasted token (step 4 of "Choosing the refresh token").
         self._entry = new_entry
+        stored = self._persist(new_entry, what="the new tokens")
         new_rt = str(new_entry["refresh_token"])
         if new_rt != self._env_rt:
-            if write_env_value(self._s.env_file, ENV_REFRESH_TOKEN, new_rt):
+            if write_env_value(self._s.env_file, ENV_REFRESH_TOKEN, new_rt, stored=stored):
                 self._env_rt = new_rt
+            elif not stored:
+                log.error("The new QuickBooks refresh token could not be saved: neither %s nor .env could be "
+                          "written. If QuickBooks later rejects the old one (invalid_grant), reconnect with "
+                          "`eta qbo-auth`.", self._store.path)
         _warn_if_expiring(new_entry, now)
+
+    def _persist(self, entry: Mapping[str, Any], *, what: str) -> bool:
+        """token_store.put("qbo", entry); a write failure (full disk, permissions, a Windows sharing violation) is
+        logged and this process keeps the entry in memory (QBO-06). Never logs a token. Returns success."""
+        try:
+            self._store.put(STORE_KEY, dict(entry))
+        except OSError as exc:
+            log.error("Could not save %s to %s (%s: %s); this run keeps them in memory. Check that the file can be "
+                      "written.", what, self._store.path, type(exc).__name__, redact(str(exc)))
+            return False
+        return True
 
 
 def _warn_if_expiring(entry: Mapping[str, Any], now: float) -> None:
@@ -476,7 +496,7 @@ async def run_authorization_code_flow(settings: QboSettings, token_store: TokenS
         query = await _wait_for_callback(port, timeout=CALLBACK_TIMEOUT_S)
     else:
         print(PASTE_INSTRUCTIONS)
-        pasted = await asyncio.to_thread(input_fn, "> ")
+        pasted = await read_line(input_fn, "> ")       # interruptible: one Ctrl+C ends the process
         query = _query_part(pasted)
     code, callback_realm = parse_callback(query, expected_state=state)
     configured_realm = (settings.realm_id or "").strip()

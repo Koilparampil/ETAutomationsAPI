@@ -43,7 +43,7 @@ from ..errors import (
     VShipBookingNotFoundError,
 )
 from ..http import json_body, new_async_client, request
-from ..logging_setup import MASK, redact
+from ..logging_setup import MASK, redact, redact_excerpt
 from ..token_store import TokenStore, is_fresh, jwt_exp
 from .logic import best_match, comment_text, has_tr_swb_note, match_rank, notif_status
 
@@ -328,7 +328,7 @@ class VShipAuth:
         token = value.get("token") if isinstance(value, Mapping) else None
         if isinstance(token, str) and token.strip():
             return token.strip()
-        excerpt = self._scrub(redact(_response_text(resp))[:LOGIN_EXCERPT_CHARS], truncated=True)
+        excerpt = self._scrub(redact_excerpt(_response_text(resp), LOGIN_EXCERPT_CHARS), truncated=True)
         raise AuthError(f"VShip login succeeded but no token in response: {excerpt}")
 
 

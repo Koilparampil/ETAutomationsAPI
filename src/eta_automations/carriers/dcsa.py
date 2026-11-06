@@ -1012,10 +1012,12 @@ async def fetch_event_pages(
 
     - `request_with_auth` when `auth` is given, else `request`; `sem` is held only around each HTTP call.
     - A page is a list, or the list under WRAPPER_KEYS; anything else → CarrierLookupError.
-    - `Next-Page`: an absolute URL on the same origin is followed with its own query; one on another host
-      is NEVER followed (WARNING, stop); a path ("/…", or "?…") is resolved against the current URL; a bare
-      token is sent as `cursor`. Same origin = same scheme, host and port, so credentials are never sent
-      to another host nor downgraded to plain http.
+    - `Next-Page`: an absolute URL, a path ("/…"), a network-path ("//host/…") or a query ("?…") is resolved
+      against the current URL and followed with its own query only on the same origin; one that resolves to
+      another host is NEVER followed (WARNING, stop); a bare token is sent as `cursor`. Same origin = same
+      scheme, host and port, so credentials are never sent to another host nor downgraded to plain http
+      (review fix MSK-03: "//other-host/…" used to be joined and followed). A link that is not a valid URL
+      stops paging with a WARNING (the events read so far are kept) instead of raising httpx.InvalidURL.
     - Stops when Next-Page is missing, equals Current-Page, or the page is empty; WARNING after max_pages.
     ServiceError / AuthError from the HTTP layer propagate (carriers map them to their own messages).
     Returns (events, page_summaries); a summary is {page, status, events, elapsed_ms, current_page,
@@ -1062,15 +1064,17 @@ async def fetch_event_pages(
         })
         if not nxt or nxt == cur or not page:
             break
-        if nxt.lower().startswith(("http://", "https://")):
-            target = httpx.URL(nxt)
+        if nxt.lower().startswith(("http://", "https://")) or nxt.startswith(("/", "?")):
+            try:
+                target = httpx.URL(str(current_url)).join(nxt)   # absolute links come back as they are
+            except (httpx.InvalidURL, ValueError) as exc:
+                log.warning("[%s] Next-Page link is not a valid URL (%s) — paging stopped", label, exc)
+                break
             if not _same_origin(target, origin):
                 log.warning("[%s] Next-Page link points to another host or scheme (%s://%s) — not followed",
                             label, target.scheme, target.host)
                 break
             current_url, current_params = target, None  # the link already carries its query
-        elif nxt.startswith(("/", "?")):
-            current_url, current_params = httpx.URL(str(current_url)).join(nxt), None
         else:
             current_params = {**(current_params or {}), "cursor": nxt}
     else:

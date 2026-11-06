@@ -30,7 +30,7 @@ import httpx
 
 from . import __version__
 from .errors import ServiceError
-from .logging_setup import redact
+from .logging_setup import redact, redact_excerpt
 
 __all__ = [
     "DEFAULT_TIMEOUT",
@@ -252,7 +252,7 @@ def _status_error(service: str, method: str, resp: httpx.Response, fallback_url:
         service,
         f"unexpected HTTP {resp.status_code} for {method} {redacted_path}",
         status=resp.status_code,
-        body_excerpt=redact(_response_text(resp))[:500],
+        body_excerpt=redact_excerpt(_response_text(resp), 500),
         request_id=request_id_from(resp.headers),
     )
 
@@ -345,6 +345,6 @@ def json_body(resp: httpx.Response, *, service: str) -> Any:
             service,
             "response was not valid JSON",
             status=resp.status_code,
-            body_excerpt=redact(_response_text(resp))[:500],
+            body_excerpt=redact_excerpt(_response_text(resp), 500),
             request_id=request_id_from(resp.headers),
         ) from exc

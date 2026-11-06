@@ -47,7 +47,7 @@ from ..logging_setup import MASK, redact
 from ..models import Carrier, EtaResult
 from ..token_store import TokenStore, is_fresh, jwt_exp
 from . import dcsa
-from .base import error_text
+from .base import TokenCache, error_text
 from .dcsa import DcsaArrival, DcsaEvent
 
 __all__ = [
@@ -340,6 +340,7 @@ class MaerskAuth:
                  *, wall_time: Callable[[], float] = time.time) -> None:
         self._settings = settings
         self._store = token_store
+        self._cache = TokenCache(token_store, TOKEN_STORE_KEY, label="Maersk")   # best-effort writes (MSK-05)
         self._http = http
         self.wall_time = wall_time  # epoch seconds (token expiry), injectable for tests
         self._lock = asyncio.Lock()
@@ -360,7 +361,7 @@ class MaerskAuth:
 
     async def invalidate(self) -> None:
         """Drop the cached token (request_with_auth() calls this on a 401, then retries once)."""
-        self._store.delete(TOKEN_STORE_KEY)
+        self._cache.delete()
 
     def cached_entry(self) -> dict[str, Any] | None:
         """For probe(): a copy of the cached entry WITHOUT access_token when it is valid (fresh, same
@@ -373,14 +374,14 @@ class MaerskAuth:
 
     # ── internals ──
     def _valid_entry(self) -> dict[str, Any] | None:
-        entry = self._store.get(TOKEN_STORE_KEY)  # TokenStore.get returns a copy
+        entry = self._cache.get()  # a copy
         if entry is None or entry.get("key_fingerprint") != self._fingerprint:
             return None
         return entry if is_fresh(entry, now=self.wall_time()) else None
 
     def _known_secrets(self) -> tuple[str, ...]:
         """Values that must never appear in messages or probe output (Consumer-Key, secret, token)."""
-        entry = self._store.get(TOKEN_STORE_KEY) or {}
+        entry = self._cache.get() or {}
         token = entry.get("access_token")
         values = [self._settings.client_secret, self._settings.client_id]
         if isinstance(token, str):
@@ -417,7 +418,7 @@ class MaerskAuth:
             expires_at = exp if exp is not None else now + DEFAULT_TOKEN_LIFETIME_S
         token_type = body.get("token_type")
         scope = body.get("scope")
-        self._store.put(TOKEN_STORE_KEY, {
+        self._cache.put({
             "access_token": token,
             "expires_at": expires_at,
             "token_type": token_type if isinstance(token_type, str) else None,
@@ -597,6 +598,8 @@ class MaerskClient:
             raise self._lookup_error(ref, exc) from exc
         except httpx.HTTPError as exc:
             raise CarrierLookupError(self._scrub_text(f"Maersk API network error: {exc!r}")) from exc
+        except OSError as exc:  # 03 §5 safety net (MSK-05), e.g. a local file error
+            raise CarrierLookupError(self._scrub_text(f"Maersk lookup failed for {ref}: {exc!r}")) from exc
 
     async def _fetch_events(self, ref: str, *, event_types: str | None,
                             summaries: list[dict[str, Any]] | None = None

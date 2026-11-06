@@ -218,3 +218,10 @@ def test_jwt_exp_returns_none_for_non_jwts(token: str) -> None:
 
 def test_jwt_exp_rejects_non_string() -> None:
     assert jwt_exp(None) is None  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("payload", [b'{"exp": 1' + b"0" * 400 + b"}", b'{"exp": 1e400}', b'{"exp": -1e400}'])
+def test_jwt_exp_returns_none_for_an_exp_too_large_for_a_float(payload: bytes) -> None:
+    """03 §7: None on any decoding error — an integer `exp` of 400 digits overflows float() (FND-03)."""
+    token = "eyJhbGciOiJub25lIn0." + base64.urlsafe_b64encode(payload).decode().rstrip("=") + ".sig"
+    assert jwt_exp(token) is None

@@ -1162,3 +1162,58 @@ def test_snapshot_dataclass_shape() -> None:
     assert snap.raw == fixture_json("shipsgo_detail_inprogress.json")  # the body as received
     with pytest.raises(ValueError, match="no 'shipment' object"):
         snapshot_from_shipsgo([])
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# read-only (dry run): never registers, never writes the state file (review fix CRA-01)
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+async def test_read_only_client_never_registers_nor_writes_the_state_file(
+        api: respx.MockRouter, agg_settings: Callable[..., AggregatorSettings], fixed_clock: FixedClock,
+        sleeps: Sleeps, make_settings: Callable[..., Any], token_store: Any) -> None:
+    """`eta run --dry-run` writes nothing anywhere (11 §2): a read-only client never POSTs a create (1 credit each)
+    and never writes aggregator_tracking.json. The free lookups still run, so a booking the provider already tracks
+    keeps its ETA in the plan."""
+    settings = agg_settings()
+    client = AggregatorClient(settings, clock=fixed_clock, sleep=sleeps, read_only=True)
+    assert client.read_only is True
+
+    def listing(request: httpx.Request) -> httpx.Response:
+        found = request.url.params["filters[booking_number]"] == f"eq:{MSC_BOOKING}"
+        return respond("shipsgo_list_found.json" if found else "shipsgo_list_empty.json")
+
+    lists = api.get(LIST).mock(side_effect=listing)
+    create = api.post(LIST).mock(return_value=respond("shipsgo_create_200.json"))
+    api.get(detail_path(501234)).mock(return_value=respond("shipsgo_detail_sailing.json"))
+    try:
+        counts = await client.prepare([(Carrier.MSC, NEW_BOOKING), (Carrier.MSC, MSC_BOOKING)])
+        assert (counts["created"], counts["found"], counts["failed"]) == (0, 1, 1)
+        with pytest.raises(AggregatorBookingError) as info:
+            await client.get_eta(Carrier.MSC, NEW_BOOKING)
+        assert str(info.value) == ("MSC booking EBKG87654321 is not registered with ShipsGo yet — a real run "
+                                   "registers it (1 credit)")
+        result = await client.get_eta(Carrier.MSC, MSC_BOOKING)
+        assert result.eta == datetime(2026, 11, 12, 7, 30)
+    finally:
+        await client.aclose()
+    assert create.call_count == 0 and client.creates_this_run == 0
+    assert not settings.state_file.exists()
+    assert lists.call_count == 3          # the found booking is remembered in memory for the rest of the run
+    real = make_settings({"AGG_API_TOKEN": TOKEN, "ETA_PROVIDER_CMA": "aggregator"})
+    built = build_client(real, token_store)
+    assert built is not None and built.read_only is False and built.state.read_only is False
+    built.set_read_only()                                  # what build_router(read_only=True) does
+    assert built.read_only is True and built.state.read_only is True
+    await built.aclose()
+
+
+async def test_read_only_with_allow_create_false_keeps_the_allow_create_message(
+        api: respx.MockRouter, agg_settings: Callable[..., AggregatorSettings], fixed_clock: FixedClock,
+        sleeps: Sleeps) -> None:
+    client = AggregatorClient(agg_settings(AGG_ALLOW_CREATE="false"), clock=fixed_clock, sleep=sleeps,
+                              read_only=True)
+    api.get(LIST).mock(return_value=respond("shipsgo_list_empty.json"))
+    try:
+        with pytest.raises(AggregatorBookingError, match="AGG_ALLOW_CREATE=false"):   # a real run would not either
+            await client.get_eta(Carrier.MSC, NEW_BOOKING)
+    finally:
+        await client.aclose()

@@ -44,7 +44,7 @@ from ..token_store import TokenStore
 from .auth import QboAuth
 
 if TYPE_CHECKING:
-    from .email import InvoiceEmailer, SendReceipt
+    from .email import InvoiceEmailer, SendReceipt, TemplateSwapEmailer
 
 __all__ = [
     "EtaFieldSpec",
@@ -473,6 +473,7 @@ class QboClient:
         self._eta_field: EtaFieldSpec | None = None
         self._warned: set[str] = set()
         self._emailer: InvoiceEmailer | None = None
+        self._recovery_emailer: TemplateSwapEmailer | None = None   # XCT-03: recovery without a template_swap emailer
         self._send_ready = False
         self._closed = False
 
@@ -973,6 +974,49 @@ class QboClient:
         if not effective_dry_run:
             self._send_ready = True
 
+    async def recover_email_template(self) -> bool:
+        """ADDITION (review fix XCT-03) — the 04b §6.2 step 1 crash recovery on its own, whatever QB_EMAIL_STRATEGY is
+        (as `eta probe qbo --restore-template`): restore the invoice e-mail subject a crashed template_swap run left in
+        `<state_dir>/qbo_email_template_recovery.json` and delete the file. True when a recovery file was handled,
+        False when there was nothing to do. Raises TemplateRestoreError (with the manual instructions) or
+        EmailPathUnavailableError (another company's file); RuntimeError on a read-only client."""
+        self._ensure_writable()
+        emailer = self._template_recovery()
+        return False if emailer is None else await emailer.recover()
+
+    def _template_recovery(self) -> TemplateSwapEmailer | None:
+        """The template_swap emailer that owns the recovery file: the strategy itself, else one built for it."""
+        # local import: email.py imports this module
+        from .email import TemplateSwapEmailer
+
+        if isinstance(self._emailer, TemplateSwapEmailer):
+            return self._emailer
+        if self._state_dir is None:
+            return None
+        if self._recovery_emailer is None:
+            self._recovery_emailer = TemplateSwapEmailer(self, state_dir=self._state_dir, clock=self._clock)
+        return self._recovery_emailer
+
+    async def _recover_template_at_close(self) -> None:
+        """aclose() fallback (XCT-03): a client whose own strategy is not template_swap, or that never sent, still
+        repairs a template left swapped by a crashed template_swap run. Never raises; a read-only client warns."""
+        # local import: email.py imports this module
+        from .email import RECOVERY_FILE_NAME, TemplateSwapEmailer
+
+        if self._state_dir is None or isinstance(self._emailer, TemplateSwapEmailer):
+            return  # a template_swap strategy handles its recovery file in its own aclose()
+        path = self._state_dir / RECOVERY_FILE_NAME
+        if not path.exists():
+            return
+        if self._read_only:
+            log.warning("The QuickBooks invoice e-mail subject may still be modified by a crashed run (%s); the next "
+                        "real run restores it (or `eta probe qbo --restore-template`).", path)
+            return
+        try:
+            await self.recover_email_template()
+        except Exception as exc:  # noqa: BLE001 - cleanup must not raise; the instructions are logged
+            log.error("The QuickBooks invoice e-mail subject could not be restored at shutdown: %s", exc)
+
     async def send_invoice(self, inv: InvoiceSnapshot, *, subject: str) -> SendReceipt:
         """E-mail the invoice with this exact subject through the configured strategy (04 §6.6, 04b)."""
         self._ensure_writable()
@@ -1095,13 +1139,17 @@ class QboClient:
     # ── lifecycle ──
     async def aclose(self) -> None:
         """Close the e-mail strategy (it restores a swapped template, 04b §6.2), the auth client and the
-        HTTP client (04 §6.8)."""
+        HTTP client (04 §6.8). A template left swapped by a crashed run is restored even when this client built no
+        template_swap strategy (XCT-03)."""
         if self._closed:
             return
         self._closed = True
         try:
-            if self._emailer is not None:
-                await self._emailer.aclose()
+            try:
+                if self._emailer is not None:
+                    await self._emailer.aclose()
+            finally:
+                await self._recover_template_at_close()
         finally:
             try:
                 closer = getattr(self._auth, "aclose", None)

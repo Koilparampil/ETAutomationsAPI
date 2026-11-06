@@ -55,6 +55,8 @@ repository folder with the `.venv` Python; double-clicking it opens a file picke
 2. Fill in at least the **required** values below. `.env` is read from the folder you run `eta` from; every
    command except `version` also accepts `--env-file PATH`.
 3. Rules worth knowing:
+   - Save `.env` as UTF-8 text. A file saved as "ANSI" with an accented character, or as UTF-16 (Notepad's
+     "Unicode", or Windows PowerShell's `>` / `Out-File`), stops every command with exit code 2.
    - Values in `.env` **override** variables set in the operating system, as in the original tool.
    - An empty value (`NAME=`) counts as unset. Because `.env` wins, delete a `NAME=` line if you set that
      variable in the operating system instead.
@@ -134,7 +136,7 @@ The tables below mirror `spec/02-configuration.md` and the defaults in `src/eta_
 | `QB_OAUTH_SCOPES` | `com.intuit.quickbooks.accounting` | Scopes requested by `eta qbo-auth` |
 | `QB_EMAIL_STRATEGY` | `template_swap` | How invoice e-mails are sent: `template_swap` (QuickBooks sends, with a temporarily swapped subject), `graph` or `smtp` (company mailbox) |
 | `QB_EMAIL_REQUIRE_VERIFIED` | `true` | No customer e-mail until the `--send-test` probe (`eta probe qbo`) recorded a verified test send. Keep it on |
-| `QB_EMAIL_REDIRECT_TO` | — | Shadow mode: every invoice e-mail goes to this address instead of the customer (`graph`/`smtp`; see 04b §3) |
+| `QB_EMAIL_REDIRECT_TO` | — | Shadow mode: every invoice e-mail goes to this address instead of the customer (`graph`/`smtp`; see 04b §3). With `template_swap` it works only with `QB_SANDBOX=true` or for invoices whose BillEmail already is this address; any other row to e-mail fails in the plan (`QB_EMAIL_REDIRECT_TO cannot be used with template_swap on real invoices …`) before its invoice is changed. Only the recipients change: the QuickBooks ETA and DocNumber suffix, the VShip notes and ETA and the ledger are still written for real and record the notice as sent, so use it with `QB_SANDBOX=true` or on test bookings only |
 | `QB_TEST_SEND_TO` | — | Inbox of the internal test customer, used by the `--send-test` probe of `eta probe qbo` |
 | `QB_PREFS_UPDATE_MODE` | `full` | How Preferences are written: `full`, or `sparse` only after `--prefs-roundtrip` passes with it |
 | `QB_MARK_SENT` | `true` | `graph`/`smtp`: mark the invoice as sent in QuickBooks (best effort) |
@@ -246,7 +248,7 @@ API call**, including 200 and 404 answers.
 | `CMA_BEHALF_OF` | — | Partner code of the end customer; third parties only |
 | `CMA_MAX_CONCURRENCY` | `2` | Concurrent CMA calls |
 | `CMA_MAX_CALLS_PER_MINUTE` | — | Proactive calls-per-minute limit; set it (e.g. 20) if HTTP 429 appears |
-| `CMA_MAX_RETRY_AFTER_S` | `120` | Longest `Retry-After` (seconds) waited out; longer fails the lookup |
+| `CMA_MAX_RETRY_AFTER_S` | `120` | Longest `Retry-After` (seconds) waited out; longer fails the lookup, and every other CMA lookup of the run fails at once with the same message until that window has passed (no CMA call is made inside it) |
 | `CMA_TIMEOUT_S` | `30` | Read timeout (the connect timeout stays 10 s) |
 
 </details>
@@ -327,7 +329,8 @@ only").
 means the API cannot write this ETA field: see spec 04 §8.1 and decide with the business before going on.
 
 **6. E-mail verification** (one e-mail to your own test inbox):
-1. `eta probe qbo --prefs-roundtrip` → PASS.
+1. `eta probe qbo --prefs-roundtrip` → PASS: on the sandbox first (`QB_SANDBOX=true`), then on production with
+   `--yes`. A FAIL at its step 1 lists the company settings QuickBooks changed; restore them by hand.
 2. `eta probe qbo --send-test --invoice <test DocNumber>` → check the `QB_TEST_SEND_TO` inbox. The subject must be
    **exactly** the probe subject, with the invoice PDF and (if online payments are on) the pay link. Answer `y`
    only if all of that is true. This records the verification that real runs require before any customer
@@ -370,7 +373,8 @@ What a run does:
    asks for a fresh token (hidden input) on a terminal, and stops with exit code 2 otherwise.
 2. **Plan** (reads only, many rows in parallel): reads the CSV, looks up every ETA, the VShip notification
    status and the QuickBooks invoice, and decides each row's route.
-3. **Review.** Writes `reports/run_<run_id>.csv` and `.json`, prints the plan summary (counts per route, every
+3. **Review.** Checks the e-mail path (and repairs a QuickBooks e-mail template left modified by a crashed run),
+   writes `reports/run_<run_id>.csv` and `.json`, prints the plan summary (counts per route, every
    e-mail with its new DocNumber, subject and recipients, every warning), then asks
    `Apply <n> change(s) to <n> invoice(s) and send <n> e-mail(s)? [y/N]`. Anything but `y`/`yes` aborts with
    nothing changed. Without a terminal, `--yes` is required.
@@ -383,7 +387,7 @@ Useful `eta run` options:
 | Option | Meaning |
 |---|---|
 | `INPUT_CSV` | The input file (`doc_number,amount`, no header needed; a `Num,Amount` style header row is skipped). Omitted: a file picker opens |
-| `--dry-run` | Plan only: every read happens, nothing is written anywhere (no QuickBooks/VShip writes, no e-mails, no output files, no ledger); the plan report is still saved |
+| `--dry-run` | Plan only: every read happens, nothing is written anywhere (no QuickBooks/VShip writes, no e-mails, no output files, no ledger, no aggregator registration or credit); the plan report is still saved. A booking routed to the aggregator that is not tracked there yet shows `… is not registered with ShipsGo yet — a real run registers it (1 credit)` |
 | `--yes`, `-y` | Skip the confirmation prompt |
 | `--force` | Ignore the same-day e-mail ledger guard |
 | `--no-email` | Never send e-mail: e-mail rows only get their QuickBooks ETA update and VShip ETA; the e-mails to send by hand are listed in `ToEmail_<run_id>.csv` |
@@ -436,7 +440,10 @@ probe is read-only and takes no lock.
 | `eta probe all [--booking B ...] [--invoice DOC]` | Every configured read-only probe that has its arguments: qbo, vship for each booking, msc/maersk/cma for the bookings matching their pattern (CMA is billable), and the aggregator account. Exit code = the worst result |
 
 QuickBooks **write probes** (`eta probe qbo` only, one at a time) write only to the test invoice or the company
-e-mail template, and always restore what they change:
+e-mail template and restore what they change — except `--prefs-roundtrip`, whose first step writes the whole
+company Preferences object back unchanged (with `QB_PREFS_UPDATE_MODE=full`): if QuickBooks drops or changes a
+setting on that write, the probe reports FAIL and lists the settings, but it cannot undo that write. Run it with
+`QB_SANDBOX=true` first:
 
 | Flag | What it does |
 |---|---|
@@ -466,12 +473,12 @@ as the original tool. A dry run writes none of them; the plan report shows what 
 | File | Who/what it is for | Entry |
 |---|---|---|
 | `Send2Bindu.csv` | Invoices below `ETA_MIN_INVOICE_AMOUNT` | CSV row `doc_number, amount, customer_name` |
-| `Send2Ben.txt` | Both notices already sent (DocNumber ends in `AA`, or VShip shows `NOTIF #2`) | `{doc_number}` |
+| `Send2Ben.txt` | Both notices already sent (DocNumber ends in `AA`, or VShip shows `NOTIF #2`, or an earlier row of the same booking in this run sends the second notice) | `{doc_number}` |
 | `Send2Accounting.txt` | Partially paid invoice with a TR/SWB note | `{doc_number} - is partially paid and has a TR/SWB note` |
 | `PotentialCustomsHold.txt` | MSC shows a possible customs hold (no e-mail sent) | `[ERROR] #{doc_number} -  Possible Customs Hold.` |
 | `Failed_To_Process.txt` | Every row that needs a person (below) | First line, then the error text and a blank line where shown |
 | `ToEmail_<run_id>.csv` | `--no-email` runs: the e-mails to send by hand | `doc_number, invoice_id, customer, to, cc, subject, doc_number_after_sending, vship_note_after_sending` |
-| `reports/run_<run_id>.csv` and `.json` | Every run, dry runs included (rewritten when the run ends) | One row per input row: route, ETA, source, in-window, subject, actions, status, message, warnings |
+| `reports/run_<run_id>.csv` and `.json` | Every run, dry runs included (rewritten when the run ends; if the CSV is open in Excel then, the final one is written as `run_<run_id>_final.csv` and printed) | One row per input row: route, ETA, source, in-window, subject, actions, status, message, warnings |
 | `logs/eta_<YYYYmmdd_HHMMSS>.log` | Every command except `version` | DEBUG log; secrets are redacted |
 
 `Failed_To_Process.txt` entries (`{err}` is the error text, written on the next line):
@@ -484,11 +491,11 @@ as the original tool. A dry run writes none of them; the plan report shows what 
 | `[ERROR] #{doc} -  Can't determine ETA.` | The carrier has no usable ETA yet (two spaces after the dash, as in the original) |
 | `[ERROR] #{doc} - Unexpected error during carrier lookup.` | Unexpected failure; the log has the details |
 | `[ERROR] #{doc} - VShip notification lookup failed, nothing sent` | Only with `ETA_ON_NOTIF_LOOKUP_ERROR=fail` |
-| `[SKIP] #{doc} - Done in the last week` | A notice was sent within the last 7 days |
+| `[SKIP] #{doc} - Done in the last week` | A notice was sent within the last 7 days, or an earlier row of the same booking (e.g. `X` before `X A`) sends one in this run |
 | `[SKIP] #{doc} - not found in QuickBooks` | No invoice with exactly this DocNumber |
 | `[SKIP] #{doc} - duplicate row in input file (line {n})` | The same DocNumber appeared earlier in the file; only the first row was processed |
-| `[SKIP] #{doc} - already e-mailed today at {HH:MM} (ledger); use --force to resend` | This invoice was already e-mailed today (see [Troubleshooting](#troubleshooting)) |
-| `[ERROR] #{doc} - QB Invoice Processing Error, No Email Sent` | A QuickBooks step (or the TR/SWB check) failed; no e-mail went out |
+| `[SKIP] #{doc} - already e-mailed today at {HH:MM} (ledger); use --force to resend` | This invoice was already e-mailed today, or an e-mail to it today may have gone out (outcome unknown) (see [Troubleshooting](#troubleshooting)) |
+| `[ERROR] #{doc} - QB Invoice Processing Error, No Email Sent` | A QuickBooks step (or the TR/SWB check) failed; no e-mail went out — unless the error text says the e-mail **outcome is unknown** (a timeout or server error after the request went out): then the e-mail may have arrived, so check the invoice in QuickBooks (or the mailbox's Sent Items for `graph`/`smtp`) before the next run. A re-run the same day skips such an invoice until you pass `--force` |
 | `[ERROR] #{doc} - Note Write Error, QB Invoice Processing Successful` | QuickBooks (and the e-mail, if one was due) succeeded; the VShip note was not written |
 | `[ERROR] #{doc} - Booking ETA Change Failed, QB Invoice Processing Successful` | Everything succeeded except the VShip expected-arrival date |
 
@@ -512,31 +519,45 @@ the run report.
 | `VShip authentication failed: …` | Check `VSHIP_USER_NAME` / `VSHIP_PASSWORD`; `eta probe vship --booking <b>` shows details |
 | `No usable MSC access token…` / `The MSC access token expired or was rejected (HTTP 401)…` | Run `eta msc-token` and paste a fresh token from your signed-in myMSC browser session (a run started in a terminal asks for one by itself) |
 | MSC returns nothing for valid bookings | `MSC_USER_EMAIL` (default: `VSHIP_USER_NAME`) must equal your myMSC sign-in e-mail |
+| `The MSC access token contains invisible or non-ASCII characters…` / `MSC_USER_EMAIL contains non-ASCII characters…` | A token can only hold plain ASCII: copy it again in full (a shortened copy ends in `…`) and paste it with `eta msc-token`. An HTTP header cannot carry accented letters either: set `MSC_USER_EMAIL` (default: `VSHIP_USER_NAME`) to your plain myMSC sign-in e-mail |
 | `MSC's edge network refused the request from this network (Akamai 'Access Denied')…` | Run from the network where myMSC works in your browser, or switch to the official MSC API. The program does not try to get around bot protection |
 | Maersk token HTTP 400 | The "Track & Trace Events" product is not approved yet |
 | Maersk `ERR_GW_001` | Wrong `MAERSK_CLIENT_ID`: use the app's Consumer Key |
 | Maersk JSON 403 / HTML 403 | Product not subscribed, or the booking is not visible to your account / edge block: contact Maersk support with the Reference # |
 | CMA 401 / 429 | Check `CMA_API_KEY` / set `CMA_MAX_CALLS_PER_MINUTE` (e.g. 20) or ask CMA to raise the quota |
+| `cma: OAuth token request rejected: …` / `cma: OAuth token request failed: …` | The private-tier OAuth credentials (`CMA_CLIENT_ID` / `CMA_CLIENT_SECRET`) were refused, or CMA's token server could not be reached. The same message for every CMA row stops the remaining CMA lookups after `ETA_CARRIER_FAILURE_LIMIT` rows |
 | `<Carrier> lookups are not configured — set <VARIABLES> in .env` | Add the carrier's credentials, or set `ETA_PROVIDER_<CARRIER>=aggregator`. Until then its rows go to `Failed_To_Process.txt` |
 | `<Carrier> lookups are disabled (ETA_PROVIDER_<CARRIER>=off)` | Intentional; change `ETA_PROVIDER_<CARRIER>` to use the carrier |
 | `<Carrier> lookups aborted after <n> identical consecutive failures; last error: …` | The circuit breaker stopped a carrier that keeps failing the same way (e.g. an expired token). Fix the cause with its probe and run the file again |
 | `Grimaldi ETA lookup not yet implemented for booking …`, `This is a Ref Number: …`, `No carrier pattern matched booking … — process manually` | Expected: handle these rows by hand (Grimaldi only works through the aggregator) |
-| `[SKIP] #<doc> - already e-mailed today at <HH:MM> (ledger); use --force to resend` | The ledger in `ETA_STATE_DIR` shows that this invoice's e-mail already went out today, for example in an earlier run that was interrupted. Check the customer's e-mail or QuickBooks before you consider `--force`; it would send the e-mail again |
+| `[SKIP] #<doc> - already e-mailed today at <HH:MM> (ledger); use --force to resend` | The ledger in `ETA_STATE_DIR` shows that this invoice's e-mail already went out today (for example in an earlier run that was interrupted), or that a send today ended with "outcome unknown" and may have gone out. Check the customer's e-mail or QuickBooks before you consider `--force`; it would send the e-mail again |
 | `The template_swap e-mail method has not been verified for this company…` | Run the e-mail verification (`eta probe qbo --send-test --invoice <test invoice>`). Until then e-mail rows fail with `QB Invoice Processing Error, No Email Sent` and the run exits with code 4 |
-| A run was killed while sending | The next run restores the QuickBooks e-mail template subject before its prompt; `eta probe qbo --restore-template` does only that |
+| A run was killed while sending | The next real run (not a dry run) restores the QuickBooks e-mail template subject before its prompt, whatever `QB_EMAIL_STRATEGY` is and also with `--no-email` or nothing to e-mail; `eta probe qbo --restore-template` does only that. A dry run only warns |
+| `The QuickBooks invoice e-mail template must be restored by hand: …` (exit code 4) | Restoring the company-wide invoice e-mail subject failed after a send. Set the subject back as the message says (or run `eta probe qbo --restore-template` once QuickBooks answers again). The invoice being e-mailed at that moment did get its e-mail and its VShip note; the run's other e-mail rows failed with `QB Invoice Processing Error, No Email Sent` and are e-mailed by the next run |
 | `Another ETAutomationsAPI run is in progress (lock: …)` | Wait for the other run. The lock is released by the operating system when that process ends, so a leftover `run.lock` file is harmless |
-| `Missing required settings: …` / `<NAME> must be …` / `Settings file not found: …` | Fix `.env` (or the `--env-file` path) as the message says |
+| `Missing required settings: …` / `<NAME> must be …` / `Settings file not found: …` / `Cannot read the settings file …: save it as UTF-8 text` | Fix `.env` (or the `--env-file` path) as the message says; save it as UTF-8 |
 | `No input file given and no GUI available — pass the CSV path: eta run <file.csv>` | Tkinter is not available: pass the file on the command line |
-| Ctrl+C at the `[y/N]` prompt or at the `eta qbo-auth` paste prompt does not exit at once | Press Enter (or Ctrl+C again). Nothing has been changed at that point (known limitation, see `IMPLEMENTATION_NOTES.md`) |
+| Ctrl+C at the `[y/N]` prompt or at the `eta qbo-auth` paste prompt | One Ctrl+C ends the program (exit code 3); nothing has been changed at that point. On a Windows console this is not verified yet: if the window does not close, press Enter |
 
 ## Safety notes
 
 - **`eta run` changes real QuickBooks invoices and VShip bookings and sends real e-mails to real customers**
   once you answer `y` (or pass `--yes`). Try new settings against the QuickBooks sandbox (`QB_SANDBOX=true`
   with sandbox keys) and with `--dry-run` first, and start live use with `--limit` or `--only`.
-- Nothing is written before the confirmation. Without a terminal and without `--yes` the run aborts.
+- Nothing is written before the confirmation, except the repair of a QuickBooks e-mail template subject left
+  modified by a crashed run. Without a terminal and without `--yes` the run aborts.
+- Ctrl+C while the changes are applied lets every write that has started finish, then stops. An invoice is
+  never left with the `A` suffix but no e-mail, or e-mailed without its VShip `NOTIF` note: the suffix is put
+  back, or the note is written, first (a failure there is written to `Failed_To_Process.txt`). The report marks
+  the unfinished rows `INTERRUPTED`; run the file again to finish them.
 - A send that may have reached QuickBooks or the mail server is never retried. The ledger blocks a second e-mail
-  for the same invoice on the same day; use `--force` only when you are sure the first one did not arrive.
+  for the same invoice on the same day, also after a send whose outcome is unknown (the error says
+  `outcome unknown`); use `--force` only when you are sure the first one did not arrive. The ledger guards only
+  the same day: check an "outcome unknown" invoice before the next day's run.
+- `QB_EMAIL_REDIRECT_TO` (shadow mode) changes only who receives the e-mails. QuickBooks (ETA, DocNumber suffix)
+  and VShip (notes, ETA) are still changed and the ledger still records the e-mails, so those invoices count as
+  notified afterwards: use it with `QB_SANDBOX=true` or on test bookings only. The plan summary says so when it is
+  set.
 - No customer e-mail goes out until the one-time `--send-test` verification has been recorded
   (`QB_EMAIL_REQUIRE_VERIFIED=true`; keep it on).
 - `template_swap` briefly changes the company-wide QuickBooks invoice e-mail subject for each send; staff

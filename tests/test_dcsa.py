@@ -1056,6 +1056,38 @@ async def test_fetch_event_pages_foreign_host_not_followed(caplog: pytest.LogCap
     assert "not followed" in caplog.text and "evil.example.test" in caplog.text
 
 
+async def test_fetch_event_pages_never_follows_a_protocol_relative_link_to_another_host(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """MSK-03 (09 §A.3.12): '//other-host/…' is a network-path reference — resolved, it points to another host, so it
+    is never followed and the bearer token never leaves the origin."""
+    caplog.set_level(logging.WARNING, logger="eta.carrier.dcsa")
+    async with respx.mock(assert_all_called=False) as router:
+        route = router.get(API)
+        route.side_effect = [httpx.Response(200, json=PAGE_1, headers={"Next-Page": "//evil.example.test/x?cursor=2"})]
+        evil = router.route(host="evil.example.test").mock(return_value=httpx.Response(200, json=PAGE_2))
+        async with httpx.AsyncClient() as client:
+            events, _ = await fetch_event_pages(client, API, service="dcsa-test", label="Test", params={},
+                                                auth=_FakeAuth())
+    assert route.call_count == 1 and evil.call_count == 0
+    assert len(events) == 2
+    assert "not followed" in caplog.text and "evil.example.test" in caplog.text
+
+
+@pytest.mark.parametrize("link", ["/v2/events?cursor=\x01", "https://api.dcsa.test/v2/events?cursor=\x01",
+                                  "https://api.dcsa.test:abc/v2/events", "//[::1/v2/events"])
+async def test_fetch_event_pages_stops_at_a_malformed_link(caplog: pytest.LogCaptureFixture, link: str) -> None:
+    """MSK-03: a Next-Page link that is not a valid URL stops paging with a WARNING (the events read so far are kept)
+    instead of raising httpx.InvalidURL, which is no httpx.HTTPError and would escape a carrier's get_eta()."""
+    caplog.set_level(logging.WARNING, logger="eta.carrier.dcsa")
+    async with respx.mock(assert_all_called=False) as router:
+        route = router.get(API)
+        route.side_effect = [httpx.Response(200, json=PAGE_1, headers={"Next-Page": link})]
+        async with httpx.AsyncClient() as client:
+            events, summaries = await fetch_event_pages(client, API, service="dcsa-test", label="Test", params={})
+    assert route.call_count == 1 and len(events) == 2 and len(summaries) == 1
+    assert any("Next-Page" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+
+
 async def test_fetch_event_pages_never_downgrades_to_http(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.WARNING, logger="eta.carrier.dcsa")
     async with respx.mock(assert_all_called=True) as router:

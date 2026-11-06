@@ -156,3 +156,39 @@ def test_missing_parent_directory_is_created(tmp_path: Path) -> None:
     path = tmp_path / "new" / "state" / LEDGER_FILE_NAME
     record_email(Ledger(path))
     assert len(lines(path)) == 1
+
+
+def test_record_after_a_torn_last_line_starts_a_new_line(ledger_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """XCT-06: a last line cut short (power loss, full disk) has no '\\n'; the next record must not be glued to
+    it, or the next start-up skips the merged line and forgets the e-mail (10 §9: only the torn line is lost)."""
+    ledger_path.write_text('{"ts": "2026-11-05T08:00:00", "action": "qbo_upd', encoding="utf-8")
+    ledger = Ledger(ledger_path)
+    record_email(ledger, invoice_id="101", sent_at="2026-11-05T09:31:00")
+    assert ledger.emailed_on("101", TODAY) == datetime(2026, 11, 5, 9, 31)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="eta.pipeline"):
+        assert Ledger(ledger_path).emailed_on("101", TODAY) == datetime(2026, 11, 5, 9, 31)
+    assert [r.getMessage() for r in caplog.records if "not valid JSON" in r.getMessage()] == [
+        f"Ledger {ledger_path} line 1 is not valid JSON - skipped"]
+    assert ledger_path.read_bytes().endswith(b"\n")
+    record_email(ledger, invoice_id="102")                  # a file that ends with '\n' gets no blank line
+    assert b"\n\n" not in ledger_path.read_bytes()
+
+
+def test_record_into_an_empty_file_writes_no_blank_line(ledger_path: Path) -> None:
+    ledger_path.write_bytes(b"")
+    record_email(Ledger(ledger_path))
+    assert ledger_path.read_bytes().count(b"\n") == 1 and not ledger_path.read_bytes().startswith(b"\n")
+
+
+def test_an_email_whose_outcome_is_unknown_counts_for_the_same_day_guard(ledger_path: Path) -> None:
+    """RUL-02 (04b §7): a send that may have reached the provider is recorded with ok=false and
+    detail.outcome_unknown=true; the guard counts it (at the record time), so a same-day re-run needs --force."""
+    ledger = Ledger(ledger_path, clock=FixedClock(datetime(2026, 11, 5, 9, 30)))
+    ledger.record(run_id="r1", doc_number="EBKG1", invoice_id="1001", base_booking="EBKG1", action=EMAILED,
+                  detail={"subject": "s", "error": "outcome unknown", "outcome_unknown": True}, ok=False)
+    ledger.record(run_id="r1", doc_number="EBKG2", invoice_id="1002", base_booking="EBKG2", action=EMAILED,
+                  detail={"subject": "s", "error": "rejected", "outcome_unknown": False}, ok=False)
+    assert ledger.emailed_on("1001", TODAY) == datetime(2026, 11, 5, 9, 30)
+    assert Ledger(ledger_path).emailed_on("1001", TODAY) == datetime(2026, 11, 5, 9, 30)
+    assert Ledger(ledger_path).emailed_on("1002", TODAY) is None          # a certain failure never counts

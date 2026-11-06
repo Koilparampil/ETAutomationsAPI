@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
@@ -15,10 +16,12 @@ from eta_automations.logging_setup import (
     LOG_FORMAT,
     LOGGER_NAMES,
     MASK,
+    REDACT_INPUT_MAX,
     configure_logging,
     is_secret_key,
     log_file_path,
     redact,
+    redact_excerpt,
     reset_logging,
 )
 
@@ -132,6 +135,49 @@ def test_redact_is_idempotent(text: str) -> None:
 def test_redact_escaped_quotes_inside_json_value() -> None:
     text = r'{"client_secret": "a\"b\\c", "next": "kept"}'
     assert redact(text) == '{"client_secret": "***", "next": "kept"}'
+
+
+# ── redact(): linear time on hostile or pathological text (FND-02) ─────────────────────────────────
+@pytest.mark.parametrize("text", [
+    "authorization:" + " " * 200_000,
+    "authorization=" + " " * 200_000,
+    "Proxy-Authorization: '" + " " * 200_000,
+    "Note:" + " " * 200_000,
+    "Note:" + " \t" * 100_000,
+    "a." * 100_000,
+    "a-b+c." * 35_000,
+], ids=["auth-colon-spaces", "auth-equals-spaces", "auth-quote-spaces", "header-spaces", "header-tabs",
+        "scheme-dots", "scheme-mixed"])
+def test_redact_takes_linear_time_on_long_runs(text: str) -> None:
+    """Each of these took minutes before (quadratic backtracking in the event-loop thread): a single hostile error
+    body could freeze a run. Now each is well under a second."""
+    started = time.perf_counter()
+    redact(text)
+    assert time.perf_counter() - started < 1.0
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Authorization:" + " " * 40 + "Bearer abc123", "Authorization: ***"),
+    ("x authorization=" + " " * 40 + "Basic dXNlcjpwYXNz end", "x authorization=***" + " " * 40 + "Basic *** end"),
+    ("X-Api-Key:\t\t \t" + " " * 100 + "K-1 \t ", "X-Api-Key: *** \t "),
+    ("git+ssh://user:pa55@host/x", "git+ssh://user:***@host/x"),
+    ("see a.b-c.https://user:pa55@host/x", "see a.b-c.https://user:***@host/x"),
+])
+def test_redact_still_masks_after_long_whitespace_runs(text: str, expected: str) -> None:
+    assert redact(text) == expected
+
+
+def test_redact_excerpt_bounds_the_work_and_masks_a_value_cut_at_the_boundary() -> None:
+    body = '{"refresh_token":"RT-' + "S" * 100_000 + '"}'           # no whitespace: cut inside the value
+    assert redact_excerpt(body, 100_000) == '{"refresh_token":"***'
+    assert redact_excerpt('{"refresh_token": "RT-1", "n": 1}') == '{"refresh_token": "***", "n": 1}'
+    assert redact_excerpt("short", 3) == "sho"
+    # a cut never splits a URL with user:password@ (moved back to the last whitespace)
+    url_body = "y" * (REDACT_INPUT_MAX - 20) + " https://user:hunter2@proxy.example/x " + "z" * 100
+    assert "hunter" not in redact_excerpt(url_body, 100_000)
+    started = time.perf_counter()
+    assert len(redact_excerpt("authorization:" + " " * 1_000_000)) <= 500
+    assert time.perf_counter() - started < 1.0
 
 
 # ── configure_logging() ────────────────────────────────────────────────────────────────────────────
