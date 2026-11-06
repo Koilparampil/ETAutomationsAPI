@@ -43,6 +43,7 @@ __all__ = [
     "qb_processing_error_entry",
     "revert_failed_note",
     "reverted_note",
+    "same_booking_notice_not_sent_reason",
     "subject_for",
     "unexpected_carrier_error_entry",
     "vship_comment_for",
@@ -230,3 +231,10 @@ def reverted_note(old_doc_number: str) -> str:
 def revert_failed_note(error: object) -> str:
     """10 Phase 4 / D11: appended to the send error when putting the DocNumber back failed too."""
     return f"(could not revert invoice number: {error})"
+
+
+def same_booking_notice_not_sent_reason(giver_doc_number: str) -> str:
+    """Review fix NEW-02: reason (inside qb_processing_error_entry) for a row of a booking whose notice in this run
+    was to come from an earlier row (`giver_doc_number`) whose e-mail was then not sent (or its outcome is unknown)."""
+    return (f"not processed: #{giver_doc_number} (same booking) was to give this booking's notice in this run, but its "
+            "e-mail was not confirmed as sent - run the file again")

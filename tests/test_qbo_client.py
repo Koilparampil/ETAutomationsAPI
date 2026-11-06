@@ -22,10 +22,12 @@ from eta_automations.errors import (
     AmbiguousInvoiceError,
     AuthError,
     ConfigError,
+    EmailPathUnavailableError,
     InvoiceNotFoundError,
     InvoiceSendError,
     InvoiceUpdateError,
     ServiceError,
+    TemplateRestoreError,
 )
 from eta_automations.http import AsyncLimiter
 from eta_automations.qbo.client import (
@@ -958,3 +960,50 @@ async def test_read_only_client_never_restores_the_template_but_warns(make_setti
         await client.aclose()
     assert recovery.exists()
     assert any("may still be modified" in m for m in caplog.messages)
+
+
+@pytest.mark.parametrize(("content", "error_type", "message"), [
+    (json.dumps({"realm_id": "999", "original_subject": ORIGINAL_SUBJECT}), EmailPathUnavailableError,
+     "recovery file belongs to another QuickBooks company: {path}"),
+    ("{not json", TemplateRestoreError, "The e-mail template recovery file {path} is not valid JSON."),
+    ("[]", TemplateRestoreError, "The e-mail template recovery file {path} has an unexpected format."),
+    (json.dumps({"realm_id": REALM}), TemplateRestoreError, "The recovery file {path} has no original subject"),
+], ids=["another company", "not JSON", "not an object", "no original subject"])
+async def test_a_recovery_file_this_company_cannot_use_is_flagged(make_settings, state_dir, caplog, content: str,
+                                                                  error_type: type[Exception], message: str) -> None:
+    """NEW-03: recover_email_template() marks the errors where the recovery file itself is the problem (another
+    company's file, or one that cannot be read): only a run that e-mails through template_swap must stop for them.
+    Closing the client leaves the file alone with a WARNING, not an ERROR that would call this company's template
+    broken."""
+    from eta_automations.qbo.email import RECOVERY_FILE_NAME
+
+    caplog.set_level(logging.WARNING, logger="eta")
+    path = state_dir / RECOVERY_FILE_NAME
+    path.write_text(content, encoding="utf-8")
+    client = make_client(make_settings(GRAPH_ENV), state_dir=state_dir)
+    with respx.mock(assert_all_mocked=True):
+        with pytest.raises(error_type) as info:
+            await client.recover_email_template()
+        await client.aclose()
+    assert str(info.value).startswith(message.format(path=path))
+    assert getattr(info.value, "recovery_file_unusable", None) is True
+    assert path.exists()
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert any(str(path) in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+
+
+async def test_a_failed_restore_of_this_company_s_template_is_not_flagged(make_settings, state_dir, load_fixture,
+                                                                          http_sleeps) -> None:
+    """NEW-03: when this company's own template could not be put back, the run must still report it (exit 4)."""
+    write_recovery_file(state_dir)
+    client = make_client(make_settings(GRAPH_ENV), state_dir=state_dir)
+    prefs = copy.deepcopy(load_fixture("qbo/preferences.json"))
+    prefs["Preferences"]["EmailMessagesPrefs"]["InvoiceMessage"]["Subject"] = SWAPPED_SUBJECT
+    fault = {"Fault": {"Error": [{"Message": "Request has invalid or unsupported property", "Detail": "x",
+                                  "code": "2010"}], "type": "ValidationFault"}}
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{COMPANY}/preferences").mock(return_value=httpx.Response(200, json=prefs))
+        router.post(f"{COMPANY}/preferences").mock(return_value=httpx.Response(400, json=fault))
+        with pytest.raises(TemplateRestoreError) as info:
+            await client.recover_email_template()
+    assert getattr(info.value, "recovery_file_unusable", None) is False

@@ -218,6 +218,12 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
   empty template subject at preflight raises `EmailPathUnavailableError`; an unreadable recovery file raises
   `TemplateRestoreError`; failing to write the recovery file raises `EmailPathUnavailableError`. A cancellation
   during the swap write or the send still triggers the restore.
+- **Unusable recovery file** (review fix NEW-03): the errors about the recovery file itself — another company's
+  realm (the exact 04b §6.2 step 1 text), unreadable, not JSON, not an object, no original subject — carry
+  `recovery_file_unusable=True` (a class attribute added to `EmailPathUnavailableError`, default False; their
+  classes and texts are unchanged). The template_swap preflight still fails with them; the pipeline's repair for
+  runs without template_swap e-mails and `QboClient.aclose()` only warn about them (see `pipeline.py`). A failed
+  restore of this company's template is not marked.
 - Send failures are classified: a failure at the token endpoint, a 400/401/403/404/429/503 or a connect error
   means "not sent, safe to retry"; timeouts, 500/502/504 and unreadable answers mean "outcome unknown" and set
   `outcome_unknown=True` on the raised `InvoiceSendError` (also for Graph/SMTP, and for a `TemplateRestoreError`
@@ -455,26 +461,47 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
   subject left swapped by a crashed template_swap run only through the template_swap preflight, i.e. only in runs
   that send through template_swap. Every other real run (nothing to e-mail, `--no-email`, `graph`/`smtp`) now calls
   `QboClient.recover_email_template()` (an addition: the `--restore-template` recovery) before the prompt when the
-  recovery file exists; a dry run only warns. A failure prints the manual instructions (before the prompt and in the
-  final summary) and the run exits 4. `QboClient.aclose()` does the same recovery as a fallback (10 §3).
+  recovery file exists; a dry run only warns. A failed restore prints the manual instructions (before the prompt and
+  in the final summary) and the run exits 4. `QboClient.aclose()` does the same recovery as a fallback (10 §3).
+  **A recovery file this company cannot use** (review fix NEW-03) — one of another QuickBooks company, e.g. left by
+  a sandbox run before `QB_SANDBOX` was switched off, or one that cannot be read — says nothing about this
+  company's template. Such a run (it e-mails nothing through template_swap) logs a WARNING naming the file and the
+  reason, leaves the file alone and keeps exit code 0; `QboClient.aclose()` also only warns. A run that e-mails
+  through template_swap keeps the hard failure of its preflight (04b §6.2 step 1: no e-mail, exit 4).
 - A NOTIFY row already running when the e-mail path breaks does not send; it gets the stored error and its
   DocNumber is reverted (D11). NOTIFY rows not yet started fail without any action.
 - An unresolved VShip booking id fails the VShip steps with `Note Write Error, QB Invoice Processing Successful`
   (01 §6.6), including PAID_UPDATE rows that have no comment step.
 - A partially paid invoice whose internal comments are unavailable fails the TR/SWB check with
   `QB Invoice Processing Error, No Email Sent` (01 §6.7).
-- **Ctrl+C during apply:** each running plan finishes its current (shielded) action, then stops; unfinished
-  plans become INTERRUPTED, the summary is printed, the report is rewritten with stage `interrupted`, the clients
-  are closed and the lock released, then the cancellation propagates (the CLI exits 3). During planning or review
-  it prints `Interrupted before anything was changed.`.
-- **Ctrl+C never splits a notice** (review fix RUL-01; 01 §1 records a notice twice, as the `A` suffix and the VShip
-  NOTIF note). A NOTIFY plan interrupted after its suffixing QBO update and before the e-mail gets the D11 revert
-  (report: `… ; DocNumber reverted to X`), so the next run sees the invoice under its old number; one interrupted
-  after the e-mail still writes its VShip note (not the ETA patch), so the 7-day rule holds the next day. Both
-  steps are shielded like the current action. A failing revert writes `QB Invoice Processing Error, No Email Sent`
-  (`interrupted (Ctrl+C) before the e-mail was sent (could not revert …)`), a failing note its `Note Write Error`
-  entry; such rows are FAILED instead of INTERRUPTED. Sends already queued behind the template_swap lock are
-  started actions and still finish (10 Phase 4 step 3), each followed by its note.
+- **Ctrl+C during apply:** it prints at once `Stopping (Ctrl+C): finishing the changes already started for <n>
+  invoice(s). Please wait - do not press Ctrl+C again.` (review fix NEW-01), plans not started yet stop, and each
+  running plan finishes its current (shielded) action, then stops; unfinished plans become INTERRUPTED, the summary
+  is printed, the report is rewritten with stage `interrupted`, the clients are closed and the lock released, then
+  the cancellation propagates (the CLI exits 3). During planning or review it prints `Interrupted before anything was
+  changed.`. The row tasks run under `asyncio.wait` instead of a TaskGroup so that the first cancellation is seen at
+  once (a TaskGroup only re-raises it after every child has finished).
+- **A single Ctrl+C does not split a notice** (review fix RUL-01; 01 §1 records a notice twice, as the `A` suffix
+  and the VShip NOTIF note). A NOTIFY plan interrupted after its suffixing QBO update and before the e-mail gets the
+  D11 revert (report: `… ; DocNumber reverted to X`), so the next run sees the invoice under its old number; one
+  interrupted after the e-mail still writes its VShip note (not the ETA patch), so the 7-day rule holds the next
+  day. Both steps are shielded like the current action. A failing revert writes `QB Invoice Processing Error, No
+  Email Sent` (`interrupted (Ctrl+C) before the e-mail was sent (could not revert …)`), a failing note its `Note
+  Write Error` entry; such rows are FAILED instead of INTERRUPTED.
+- **Further Ctrl+C presses only repeat the stop message** (review fix NEW-01). asyncio.run() turns a second
+  Ctrl+C into KeyboardInterrupt and then cancels every task, the shielded revert/note steps included. From the
+  first Ctrl+C during apply until `run()` ends (report rewritten, clients closed, lock released), a SIGINT handler
+  installed with `signal.signal` (Windows and POSIX; nothing is installed off the main thread) only schedules the
+  stop message on the event loop, and the previous handler (asyncio.run()'s) is put back afterwards, so the CLI
+  still ends with exit code 3. Closing the console window or killing the process is not covered: that can still
+  split a notice.
+- **E-mails waiting for their template_swap turn are withdrawn at Ctrl+C** (review fix NEW-01, the optional part
+  of RUL-01; a deviation from the letter of 10 Phase 4 step 3, whose "current action" they are). template_swap
+  sends one e-mail at a time (04b §6.2 step 3); the pipeline now keeps that queue itself (`_send_turn`, one
+  template_swap `QboSend` at a time, as the e-mailer's own lock already did), so a send still waiting for its turn
+  has provably written nothing. Ctrl+C cancels it, its suffix is reverted (D11) and the row is INTERRUPTED; the
+  drain no longer waits for up to `ETA_MAX_PARALLEL_BOOKINGS` sends of about 3 QuickBooks calls each. graph/smtp
+  sends run in parallel and have no such queue: every started send finishes and gets its note.
 - The input path check (exists, file, `.csv`) runs first, before the lock and any network call (exit 2); a
   non-UTF-8 input or a CSV error is exit 2 as well.
 - `Loaded {n} booking(s) from file.` counts rows after the D2 header skip and before `--only`/`--limit`; an extra
@@ -482,10 +509,22 @@ was chosen (never send an e-mail, never write to QuickBooks or VShip when unsure
   `--only`/`--limit`.
 - **One notice per booking per run** (review fix XCT-01): rows of one booking (`X` and `X A`, a normal input pair)
   are decided from one read of its VShip notes (D18), while the original re-read the notes for each row and so saw
-  the note an earlier row had just posted. After 2c the plans are replayed in input order, keyed by VShip booking
-  id (else base booking): each NOTIFY plan adds its planned note, and a later NOTIFY plan of the same booking is
-  decided again with those notes — `NOTIF #2` → Ben, a `NOTIF #1` of today → `Done in the last week`. `ARRIVING ON`
-  notes are no notices, so pre-arrival pairs are still both e-mailed (O4).
+  the note an earlier row had just posted. The plans are replayed in input order, keyed by VShip booking id (else
+  base booking): each NOTIFY plan adds its planned note, and a later NOTIFY plan of the same booking is decided
+  again with those notes — `NOTIF #2` → Ben, a `NOTIF #1` of today → `Done in the last week`. `ARRIVING ON` notes
+  are no notices, so pre-arrival pairs are still both e-mailed (O4).
+- **The replayed row waits for the earlier row's notice** (review fix NEW-02). The replay runs in Phase 3 after the
+  e-mail preflight (step 2), so a NOTIFY plan the preflight failed gives no notice and both rows fail with the
+  e-mail path error; under `--no-email` the planned note of a manual row counts. A replayed row is held on the row
+  giving the notice: its Ben line or `Done in the last week` entry is written at the end of apply, and only if that
+  notice went out (the e-mail was sent, also when only the template restore failed afterwards; with `--no-email`,
+  its `ToEmail` row was written). Otherwise (send failed, outcome unknown, blocked, or an earlier step failed) the
+  row is not processed: `QB Invoice Processing Error, No Email Sent` with `not processed: #X (same booking) was to
+  give this booking's notice in this run, but its e-mail was not confirmed as sent - run the file again`; after
+  Ctrl+C it is INTERRUPTED (`interrupted before #X (same booking) gave the notice`). The safer choice: the
+  original would have e-mailed `X A` after a failed send of `X`, but that e-mail was not in the confirmed plan and,
+  after an "outcome unknown" send, could be a second notice; so the booking gets its notice from the next run. The
+  plan lists such a row with a warning.
 - The NOTIFY guards (no BillEmail, DocNumber too long, ledger same-day guard) run in Phase 2c, before the
   `--no-email` transformation, so they also apply to `--no-email` runs.
 - **Redirect guard** (review fix QBO-03): with `template_swap` on the production company and
@@ -578,7 +617,7 @@ failed before the fix; the reasons are in section A under the module named.
 
 | Finding | Change | Files |
 |---|---|---|
-| RUL-01 | Ctrl+C never leaves a notice half-recorded (suffix reverted, or NOTIF note written) | `pipeline.py` |
+| RUL-01 | One Ctrl+C no longer leaves a notice half-recorded (suffix reverted, or NOTIF note written); see NEW-01 for further Ctrl+C presses | `pipeline.py` |
 | RUL-02 / XCT-05 | "Outcome unknown" sends are flagged and block a same-day resend (ledger) | `errors.py`, `qbo/email.py`, `pipeline.py`, `ledger.py` |
 | RUL-03 / QBO-04 | A send followed by a failed template restore counts as sent; the VShip steps still run | `pipeline.py` |
 | RUL-04 | One Ctrl+C at the `[y/N]` / paste-back prompt ends the process | new `prompt.py`, `pipeline.py`, `qbo/auth.py`, `cli.py` |
@@ -619,6 +658,20 @@ QBO-01 (an outcome-unknown send must block a same-day resend) and QBO-05 (a temp
 runs without e-mails) needed no change: area A's fixes RUL-02 and XCT-03 already implement them, and their tests
 cover the findings' test plans. `tests/fakes.py` gained `UnwritableTokenStore`.
 
+**Review fixes, round 2** (problems found in the round-1 fixes). Each fix has a regression test that failed before
+the fix; the reasons are in section A under `pipeline.py` and `qbo/email.py`.
+
+| Finding | Change | Files |
+|---|---|---|
+| NEW-01 | Ctrl+C during apply says at once that the started changes are finished and that Ctrl+C must not be pressed again; further Ctrl+C presses only repeat that (temporary SIGINT handler) instead of cancelling the revert/note steps; e-mails still waiting for their template_swap turn are withdrawn (suffix reverted) | `pipeline.py`, `README.md` |
+| NEW-02 | A row sent to Ben or skipped because an earlier row of its booking gives the notice is written only once that notice went out; otherwise it is reported as not processed (never e-mailed in its place). The replay runs after the e-mail preflight | `pipeline.py`, `texts.py`, `README.md` |
+| NEW-03 | A recovery file of another QuickBooks company, or an unreadable one, only warns (exit 0) in runs that e-mail nothing through template_swap; template_swap runs with e-mails keep the hard failure | `errors.py`, `qbo/email.py`, `qbo/client.py`, `pipeline.py`, `README.md` |
+
+The tests are in `tests/test_pipeline.py` (the deterministic Ctrl+C tests emulate asyncio.run()'s SIGINT handler and
+call the installed handler as the second Ctrl+C; no real signal is sent), `tests/test_qbo_client.py` and
+`tests/test_docs.py`. `test_interruption_with_parallel_sends_writes_the_note_of_every_e_mailed_row` now runs with
+`graph` (`…_parallel_graph_sends_…`): with template_swap the queued sends are withdrawn instead.
+
 ---
 
 ## C. Open issues
@@ -631,7 +684,11 @@ cover the findings' test plans. `tests/fakes.py` gained `UnwritableTokenStore`.
    `input()` would hang glibc's `exit()`, which locks the stdin `FILE` that `fgets()` holds); elsewhere — the
    Windows console, an injected input function — `input_fn` runs in a daemon thread. One Ctrl+C now exits with
    code 3 (tested on Linux through a pseudo-terminal). On Windows the console path is not verified; the
-   double-click pause reuses a reader left waiting by Ctrl+C, so one Enter closes the window.
+   double-click pause reuses a reader left waiting by Ctrl+C, so one Enter closes the window. The same holds for
+   Ctrl+C during apply (review fix NEW-01): the temporary SIGINT handler uses only `signal.signal` and
+   `loop.call_soon_threadsafe`, which Windows supports, and was tested on Linux with real signals through `eta run`
+   (fake services, three SIGINTs: the stop message each time, the note or revert written, exit code 3), but not
+   on a Windows console (section D).
 2. **Python 3.12 is only partly verified.** All source and test files parse under Python 3.12.3, but no 3.12
    virtual environment could be created in the build container. Running the suite with 3.12 against the 3.13
    environment's packages gave 1444 passed and 109 failed; every failure inspected was numpy's 3.13 binary
@@ -643,8 +700,8 @@ cover the findings' test plans. `tests/fakes.py` gained `UnwritableTokenStore`.
 4. **Nothing has been run against a real service yet.** Every probe and the opt-in live smoke tests
    (`tests/test_live_smoke.py`) are still to be run with real credentials (section D).
 5. **Windows-only paths are tested with fakes only:** the `msvcrt` branch of the run lock, the default
-   `ETA_STATE_DIR`, the Tk file picker of double-click mode, and Ctrl+C at the CLI's own prompts on a Windows
-   console (section D lists a check for each).
+   `ETA_STATE_DIR`, the Tk file picker of double-click mode, Ctrl+C at the CLI's own prompts and Ctrl+C during
+   apply on a Windows console (section D lists a check for each).
 6. **Circuit breaker cannot trip on per-booking error texts** (spec tension left as written). The 07 §6.4 Maersk
    JSON-403 text ("the app is not approved … or booking {ref} is not visible …") and catch-all 5xx texts contain
    the booking number, so repeated identical causes do not trip the breaker; each booking fails on its own. The
@@ -796,6 +853,11 @@ under `<ETA_STATE_DIR>/probe/`; the item says what to look for in it.
   at the prompt, then press ENTER at `Press ENTER to close this window...`.
 - [ ] **Ctrl+C on a Windows console.** `eta probe qbo --write-test --invoice <test DocNumber whose ETA is set>`,
   press Ctrl+C at the confirmation question → exit code 3, nothing written.
+- [ ] **Ctrl+C twice while a run applies, on a Windows console** (sandbox: `QB_SANDBOX=true`, a file of several
+  in-window test bookings, `ETA_MAX_PARALLEL_BOOKINGS=4`). Press Ctrl+C while the changes are applied →
+  `Stopping (Ctrl+C): finishing the changes already started …` at once; press it again → the line is repeated and
+  the run goes on to its summary and exit code 3. In QuickBooks and VShip every row is whole: an invoice with the
+  new `A` suffix has its e-mail and its `NOTIF` note, the others have their old DocNumber.
 - [ ] **Python 3.12.** `py -3.12 -m venv .venv312`, `.venv312\Scripts\pip install -e ".[dev]"`,
   `.venv312\Scripts\python -m pytest -q` → all tests pass (only `live` tests and the German-locale test skipped).
 - [ ] **Optional live smoke tests** (read-only probes; no writes, no e-mail). On Windows, set each variable

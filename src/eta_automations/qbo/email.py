@@ -371,6 +371,13 @@ def _outcome_unknown(exc: InvoiceSendError) -> InvoiceSendError:
     return exc
 
 
+def _unusable_recovery_file[E: EmailPathUnavailableError](exc: E) -> E:
+    """Mark an error about a recovery file this company cannot use — another company's, or unreadable (review fix
+    NEW-03): only a run that e-mails through template_swap stops for it; any other run warns and goes on."""
+    exc.recovery_file_unusable = True
+    return exc
+
+
 def _swap_redirect(settings: QboSettings, inv: InvoiceSnapshot) -> tuple[str | None, str | None]:
     """The 04b §3 redirect rule of a template_swap send: (sendTo, refusal). QBO's `sendTo` overwrites the invoice's
     customer e-mail, so a redirect is allowed only on the sandbox or when BillEmail already is the redirect."""
@@ -482,26 +489,28 @@ class TemplateSwapEmailer:
 
     # ── files ──
     def _load_recovery(self) -> dict[str, Any] | None:
+        """The recovery record, or None when there is no file. An unreadable file raises TemplateRestoreError marked
+        `recovery_file_unusable` (review fix NEW-03)."""
         try:
             text = self.recovery_path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
         except (OSError, UnicodeError) as exc:
-            raise TemplateRestoreError(
+            raise _unusable_recovery_file(TemplateRestoreError(
                 f"The e-mail template recovery file {self.recovery_path} cannot be read ({type(exc).__name__}). "
                 "Check the invoice e-mail subject in QuickBooks (Settings → Account and settings → Sales → "
-                "Messages), then delete the file.") from exc
+                "Messages), then delete the file.")) from exc
         try:
             data = json.loads(text)
         except ValueError as exc:
-            raise TemplateRestoreError(
+            raise _unusable_recovery_file(TemplateRestoreError(
                 f"The e-mail template recovery file {self.recovery_path} is not valid JSON. Check the invoice "
                 "e-mail subject in QuickBooks (Settings → Account and settings → Sales → Messages), then delete "
-                "the file.") from exc
+                "the file.")) from exc
         if not isinstance(data, dict):
-            raise TemplateRestoreError(
+            raise _unusable_recovery_file(TemplateRestoreError(
                 f"The e-mail template recovery file {self.recovery_path} has an unexpected format. Check the "
-                "invoice e-mail subject in QuickBooks, then delete the file.")
+                "invoice e-mail subject in QuickBooks, then delete the file."))
         return data
 
     def _write_recovery(self, subject: str, invoice_id: str) -> None:
@@ -629,17 +638,20 @@ class TemplateSwapEmailer:
                 self._ready = True
 
     def _checked_recovery_record(self) -> dict[str, Any] | None:
-        """The recovery record of this company with a usable original subject, or None when there is none."""
+        """The recovery record of this company with a usable original subject, or None when there is none. A file this
+        company cannot use (another company's, unreadable, no original subject) raises an error marked
+        `recovery_file_unusable` (review fix NEW-03)."""
         record = self._load_recovery()
         if record is None:
             return None
         if str(record.get("realm_id")) != str(self._s.realm_id):
-            raise EmailPathUnavailableError(f"recovery file belongs to another QuickBooks company: {self.recovery_path}")
+            raise _unusable_recovery_file(EmailPathUnavailableError(
+                f"recovery file belongs to another QuickBooks company: {self.recovery_path}"))
         original_subject = record.get("original_subject")
         if not isinstance(original_subject, str) or not original_subject:
-            raise TemplateRestoreError(
+            raise _unusable_recovery_file(TemplateRestoreError(
                 f"The recovery file {self.recovery_path} has no original subject — check the QuickBooks invoice "
-                "e-mail subject manually, then delete the file.")
+                "e-mail subject manually, then delete the file."))
         return record
 
     async def recover(self) -> bool:

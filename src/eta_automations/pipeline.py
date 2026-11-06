@@ -3,9 +3,11 @@
     Phase 0  preflight   run_now, directories, run lock (03 §14), require(qbo, vship), services, auth checks
     Phase 1  read        read_input → classify → D2 header → D3 duplicates → --only → --limit; MSC token pre-flight
     Phase 2  plan        router.prepare(); one task per row (lookups only); one batched QBO query; finalize
-    Phase 3  review      --no-email transformation, e-mail path preflight, plan report, summary, confirmation
+    Phase 3  review      --no-email transformation, e-mail path preflight, one notice per booking (XCT-01), plan
+                         report, summary, confirmation
     Phase 4  apply       routed/failed entries in input order, then every plan's actions (concurrent rows,
-                         sequential actions), D11 revert, mid-run e-mail-path failure, Ctrl+C handling
+                         sequential actions, one template_swap e-mail at a time), D11 revert, mid-run e-mail-path
+                         failure, Ctrl+C handling, then the entries held on another row's notice (NEW-02)
     Phase 5  report      Done line, per-route table, timings, final report; exit code 0 or 4
 
 Every text that reaches an output file comes from texts.py / rules.py (01 §14, byte for byte). Deliberate
@@ -22,6 +24,7 @@ import getpass
 import importlib.metadata
 import logging
 import platform
+import signal
 import sys
 import time
 from collections import Counter
@@ -30,6 +33,7 @@ from contextlib import AsyncExitStack, ExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from types import FrameType
 from typing import TYPE_CHECKING, Any, TextIO
 
 from . import __version__, texts
@@ -260,6 +264,8 @@ class _Row:
     started: bool = False                        # apply began ("not started yet", Phase 4)
     apply_failed: bool = False
     lines: list[str] = field(default_factory=list)
+    after: _Row | None = None                    # NEW-02: entry held until this row (same booking) gave the notice
+    notice_out: bool = False                     # NEW-02: this row's notice went out (e-mail sent / listed by hand)
 
 
 @dataclass
@@ -383,6 +389,8 @@ class _Run:
         self.summary = RunSummary(run_id=self.run_id, dry_run=dry_run, log_file=log_file)
         self._phase_started = time.perf_counter()
         self._services: Services | None = None
+        self._send_turn: asyncio.Lock | None = None        # NEW-01: one template_swap e-mail at a time (Phase 4)
+        self._sigint_guard: _SigintGuard | None = None     # NEW-01: Ctrl+C only repeats the stop message
 
     # ── services shortcuts ──
     @property
@@ -428,6 +436,15 @@ class _Run:
     # Phase 0 — preflight
     # ════════════════════════════════════════════════════════════════════════════════════════════
     async def execute(self, injected: Services | None) -> RunSummary:
+        try:
+            return await self._run_phases(injected)
+        finally:
+            if self._sigint_guard is not None:
+                # NEW-01: after a Ctrl+C during apply, Ctrl+C only repeated the stop message until the report was
+                # rewritten, the clients closed and the lock released; now it is back to normal.
+                self._sigint_guard.restore()
+
+    async def _run_phases(self, injected: Services | None) -> RunSummary:
         run = self.settings.run
         for directory in (run.output_dir, run.output_dir / "reports", run.output_dir / "logs"):  # step 2
             directory.mkdir(parents=True, exist_ok=True)
@@ -628,36 +645,48 @@ class _Run:
                     log.exception("Unexpected error while finalizing #%s", row.plan.doc_number)
                     self._fail(row, texts.qb_processing_error_entry(row.plan.doc_number, exc),
                                reason="QB Invoice Processing Error", error=str(exc))
-        self._one_notice_per_booking()
 
     def _one_notice_per_booking(self) -> None:
-        """Rows of one booking ('X' and 'X A', a normal input pair, 10 §6) are decided from one read of its VShip notes
-        (D18), but the original handled rows one at a time and read the notes again for each, so a later row saw the
-        note an earlier row had just posted. Replay that in input order: each NOTIFY plan adds its planned note to
-        the booking's notes, and a later NOTIFY plan of the same booking is decided again with them (01 §6 step 3,
-        §11): NOTIF #2 → Ben, a NOTIF #1 of today → 'Done in the last week'. 'ARRIVING ON' notes are no notices, so
-        those rows are unchanged (O4)."""
-        planned: dict[str, list[dict[str, Any]]] = {}
+        """Review fixes XCT-01 / NEW-02 (Phase 3, after the e-mail preflight). Rows of one booking ('X' and 'X A', a
+        normal input pair, 10 §6) are decided from one read of its VShip notes (D18), but the original handled rows
+        one at a time and read the notes again for each, so a later row saw the note an earlier row had just posted.
+        Replay that in input order: each NOTIFY plan still giving a notice (e-mail, or --no-email manual e-mail) adds
+        its planned note to the booking's notes, and a later NOTIFY plan of the same booking is decided again with
+        them (01 §6 step 3, §11): NOTIF #2 → Ben, a NOTIF #1 of today → 'Done in the last week'. Such a row is held
+        on the row giving the notice (`after`): its entry is written only once that notice went out (_settle_held).
+        Plans the preflight failed give no notice and are skipped. 'ARRIVING ON' notes are no notices, so those rows
+        are unchanged (O4)."""
+        givers: dict[str, tuple[_Row, list[dict[str, Any]]]] = {}
         for row in self.rows:
             plan = row.plan
             if plan.route is not Route.NOTIFY or not plan.actions:
                 continue
             key = plan.vship_booking_id or plan.base_booking or plan.doc_number
-            notes = planned.setdefault(key, [])
-            if notes:
+            known = givers.get(key)
+            if known is None:
+                giver, notes = givers[key] = (row, [])
+            else:
+                giver, notes = known
                 notif = notif_status([*(row.comments or []), *notes], self.run_now)
                 if notif.count == 2 or not notif.have_to_do:
-                    log.info("#%s: same booking as an earlier row of this run, which sends a notice now",
-                             plan.doc_number)
+                    log.info("#%s: same booking as #%s, which gives the notice in this run", plan.doc_number,
+                             giver.plan.doc_number)
                     plan.notif = notif
+                    row.manual = None
                     if notif.count == 2:
                         self._route(row, Route.BEN, OutputFile.BEN, texts.ben_entry(plan.doc_number))
+                        outcome = "goes to Ben"
                     else:
                         self._fail(row, texts.done_in_last_week_entry(plan.doc_number), reason="Done in the last week")
+                        outcome = "is skipped as done in the last week"
+                    row.after = giver
+                    plan.warnings.append(f"same booking as #{giver.plan.doc_number}, which gives this booking's notice "
+                                         f"in this run: {outcome} once that e-mail is sent, else it is not processed")
                     continue
-            comment = next((a for a in plan.actions if isinstance(a, VShipComment)), None)
-            if comment is not None:
-                notes.append({"comment": comment.text, "createdDate": self.run_now.isoformat()})
+            note = row.manual.note if row.manual is not None else next(
+                (a.text for a in plan.actions if isinstance(a, VShipComment)), None)
+            if note is not None:
+                notes.append({"comment": note, "createdDate": self.run_now.isoformat()})
 
     async def _plan_row_task(self, row: _Row, sem: asyncio.Semaphore) -> None:
         """A plan task never raises (10 Phase 2): every exception becomes a FAILED plan with a 01 §14 entry."""
@@ -930,6 +959,7 @@ class _Run:
                 await self.qbo.prepare_for_sending(dry_run=self.dry_run)
             except Exception as exc:  # noqa: BLE001 - any problem with the e-mail path blocks every e-mail
                 self._email_path_failed(exc, before_apply=True)
+        self._one_notice_per_booking()          # XCT-01 after step 2 (NEW-02): a row it failed gives no notice
         await self._repair_email_template(template_swap_preflight_ran=sends)
         self._write_report()                                                                # step 3
         self._print_plan_summary()                                                          # step 4
@@ -964,7 +994,10 @@ class _Run:
         left swapped by a crashed template_swap run is restored before the prompt. The template_swap preflight does it
         for runs that send through template_swap; this covers the others — nothing to e-mail, --no-email,
         QB_EMAIL_STRATEGY=graph/smtp — so the company-wide subject never keeps naming another customer's booking.
-        A dry run only warns; a failure is printed with the manual instructions and makes the run exit 4."""
+        A dry run only warns; a failed restore is printed with the manual instructions and makes the run exit 4.
+        A recovery file this company cannot use (another company's, or unreadable: review fix NEW-03) says nothing
+        about this company's template and does not touch these runs: a WARNING names it and the run goes on (a run
+        that e-mails through template_swap is stopped by its preflight instead, 04b §6.2 step 1)."""
         qbo_settings = self.settings.qbo
         recovery = self.settings.run.state_dir / RECOVERY_FILE_NAME
         if qbo_settings is None or not recovery.exists():
@@ -978,6 +1011,11 @@ class _Run:
         try:
             await self.qbo.recover_email_template()
         except Exception as exc:  # noqa: BLE001 - reported with the manual restore instructions
+            if getattr(exc, "recovery_file_unusable", False):
+                log.warning("The QuickBooks e-mail template recovery file %s was left as it is: %s This run e-mails "
+                            "nothing through template_swap, so it goes on; a template_swap run sends no e-mail while "
+                            "the file is there.", recovery, _sentence(str(exc)))
+                return
             self.restore_error = exc
             log.error("The QuickBooks invoice e-mail template could not be restored: %s", exc)
             self._print(_BANNER)
@@ -1039,23 +1077,81 @@ class _Run:
     async def _apply(self) -> None:
         for row in self.rows:                                                               # step 1
             plan = row.plan
-            if plan.actions:
+            if plan.actions or row.after is not None:      # NEW-02: a held entry waits for its booking's notice
                 continue
             if plan.output is not None:
                 self._write_output(*plan.output)
             plan.status = _status_for(plan.route)
         todo = [r for r in self.rows if r.plan.actions]                                     # step 2
-        if not todo:
-            return
-        sem = asyncio.Semaphore(max(1, self.settings.run.max_parallel_bookings))
-        try:
-            async with asyncio.TaskGroup() as tg:
+        if todo:
+            qbo_settings = self.settings.qbo
+            if qbo_settings is not None and qbo_settings.email_strategy == "template_swap":
+                # NEW-01: template_swap sends one e-mail at a time (04b §6.2 step 3). The queue is kept here, where an
+                # e-mail still waiting for its turn has written nothing and can be withdrawn by Ctrl+C (step 3).
+                self._send_turn = asyncio.Lock()
+            sem = asyncio.Semaphore(max(1, self.settings.run.max_parallel_bookings))
+            tasks = [asyncio.create_task(self._apply_row(row, sem)) for row in todo]
+            try:
+                await asyncio.wait(tasks)
+            except asyncio.CancelledError:                                                  # step 3
+                await self._drain(tasks)
                 for row in todo:
-                    tg.create_task(self._apply_row(row, sem))
-        except asyncio.CancelledError:                                                      # step 3
-            for row in todo:
-                self._mark_interrupted(row)
-            raise
+                    self._mark_interrupted(row)
+                self._settle_held(interrupted=True)
+                raise
+            for task in tasks:                  # a row task reports its own failures; anything else is a bug
+                if not task.cancelled() and (error := task.exception()) is not None:
+                    raise error
+        self._settle_held(interrupted=False)
+
+    async def _drain(self, tasks: list[asyncio.Task[None]]) -> None:
+        """Phase 4 step 3 after Ctrl+C (review fixes RUL-01, NEW-01). Says at once that the started changes are being
+        finished and that Ctrl+C must not be pressed again; until the run has ended a further Ctrl+C only repeats that
+        (asyncio.run() would turn it into KeyboardInterrupt and cancel every task, the shielded writes included).
+        Plans not started yet stop, e-mails still waiting for their template_swap turn are withdrawn (nothing has
+        been written for them), and every started action finishes with the revert or note that keeps its notice whole
+        (_settle_interrupted). A further cancellation of this task changes nothing."""
+        self._print("\n" + self._stop_message())
+        if self._sigint_guard is None:
+            self._sigint_guard = _SigintGuard(asyncio.get_running_loop(),
+                                              lambda: self._print("\n" + self._stop_message()))
+            self._sigint_guard.install()
+        for task in tasks:
+            task.cancel()
+        while not all(task.done() for task in tasks):
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait(tasks)
+
+    def _stop_message(self) -> str:
+        """NEW-01: printed at the first Ctrl+C during apply, and again at every further Ctrl+C until the run ends."""
+        busy = sum(1 for row in self.rows if row.started and row.plan.status == "PENDING")
+        doing = f"finishing the changes already started for {busy} invoice(s)" if busy else "finishing up"
+        return f"Stopping (Ctrl+C): {doing}. Please wait - do not press Ctrl+C again."
+
+    def _settle_held(self, *, interrupted: bool) -> None:
+        """End of Phase 4 (review fix NEW-02). A row that the one-notice-per-booking replay sent to Ben or skipped,
+        because an earlier row of its booking gives the notice in this run, gets its entry only once that notice went
+        out: the e-mail was sent, or with --no-email listed for sending by hand. Otherwise it is not processed — not
+        e-mailed either: that e-mail was not in the confirmed plan and could be a second notice (outcome unknown) — and
+        is reported with the reason (QB Invoice Processing Error, No Email Sent), or INTERRUPTED after Ctrl+C."""
+        for row in self.rows:
+            giver = row.after
+            plan = row.plan
+            if giver is None or plan.status != "PENDING":
+                continue
+            if giver.notice_out:
+                if plan.output is not None:
+                    self._write_output(*plan.output)
+                plan.status = _status_for(plan.route)
+            elif interrupted:
+                plan.status = "INTERRUPTED"
+                plan.message = f"interrupted before #{giver.plan.doc_number} (same booking) gave the notice"
+            else:
+                error = texts.same_booking_notice_not_sent_reason(giver.plan.doc_number)
+                entry = texts.qb_processing_error_entry(plan.doc_number, error)
+                plan.route = Route.FAILED
+                plan.output = (OutputFile.FAILED, entry)
+                self._apply_failure(row, entry, error=error, reason=error)
 
     def _mark_interrupted(self, row: _Row) -> None:
         plan = row.plan
@@ -1084,6 +1180,16 @@ class _Run:
         inv = plan.invoice
         state = _ApplyState(current=inv, original_doc=inv.doc_number if inv is not None else plan.doc_number)
         for index, action in enumerate(plan.actions):
+            turn = self._send_turn if isinstance(action, QboSend) else None
+            if turn is not None:
+                try:
+                    await turn.acquire()
+                except asyncio.CancelledError:
+                    # NEW-01: Ctrl+C while this e-mail waited for its template_swap turn. Nothing has been written for
+                    # it, so it is withdrawn; the suffix of the QBO update before it is put back (RUL-01).
+                    if index:
+                        await self._settle_interrupted(row, state, plan.actions[index - 1], plan.actions[index:])
+                    raise
             step = asyncio.ensure_future(self._execute(row, state, action))
             try:
                 ok = await asyncio.shield(step)
@@ -1098,6 +1204,9 @@ class _Run:
                     else:
                         self._finish_row(row)
                 raise
+            finally:
+                if turn is not None:
+                    turn.release()
             if not ok:
                 return
         self._finish_row(row)
@@ -1149,6 +1258,7 @@ class _Run:
         day (01 §11). Every other e-mail of this run is blocked and the restore instructions are printed (04b §6.1)."""
         plan = row.plan
         self._ledger(row, EMAILED, _receipt_detail(getattr(exc, "receipt", None)))
+        row.notice_out = True
         plan.done.append(_describe(action))
         warning = f"e-mail sent, but the QuickBooks e-mail template could not be restored afterwards: {exc}"
         plan.warnings.append(warning)
@@ -1173,6 +1283,7 @@ class _Run:
             if self.email_blocked and self.email_error is not None:
                 raise _blocked_copy(self.email_error)
             receipt = await self.qbo.send_invoice(state.current, subject=action.subject)
+            row.notice_out = True
             self._ledger(row, EMAILED, _receipt_detail(receipt))
         elif isinstance(action, VShipComment):
             booking_id = self._booking_id(plan)
@@ -1275,6 +1386,7 @@ class _Run:
             self.output_errors += 1
             log.error("Could not write the manual e-mail list (%s): %s", exc, cells)
             return
+        row.notice_out = True              # NEW-02: the notice is now a person's to send
         if path is not None:
             self.summary.to_email_csv = path
 
@@ -1494,6 +1606,54 @@ async def _finish_shielded(fut: asyncio.Future[Any]) -> None:
     while not fut.done():
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.shield(fut)
+
+
+class _SigintGuard:
+    """Ctrl+C that only repeats a message while a stopped run finishes (review fix NEW-01; Windows and POSIX).
+
+    asyncio.run() answers the first Ctrl+C by cancelling the main task, and turns a second one into KeyboardInterrupt,
+    after which it cancels every task — the shielded writes of Phase 4 step 3 included, which could leave a notice
+    half-recorded (RUL-01). Installed at the first Ctrl+C, this handler replaces asyncio.run()'s until restore(): it
+    only schedules `warn` on the event loop (printing inside a signal handler could re-enter a console write).
+    signal.signal() works the same on Windows and POSIX; outside the main thread it raises and nothing is installed
+    (Ctrl+C does not reach such a run). restore() puts the previous handler back, so asyncio.run() then restores the
+    default one as usual."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, warn: Callable[[], None]) -> None:
+        self._loop = loop
+        self._warn = warn
+        self._previous: Any = None
+        self._installed = False
+
+    def install(self) -> None:
+        try:
+            previous = signal.getsignal(signal.SIGINT)
+            if previous is signal.SIG_IGN:              # Ctrl+C is ignored anyway
+                return
+            signal.signal(signal.SIGINT, self._handle)
+        except (ValueError, OSError, RuntimeError):     # not the main thread, or no signal support
+            return
+        self._previous = previous
+        self._installed = True
+
+    def _handle(self, signum: int, frame: FrameType | None) -> None:
+        with contextlib.suppress(RuntimeError):         # the event loop is already closed
+            self._loop.call_soon_threadsafe(self._warn)
+
+    def restore(self) -> None:
+        if not self._installed:
+            return
+        self._installed = False
+        with contextlib.suppress(ValueError, OSError, RuntimeError, TypeError):
+            if signal.getsignal(signal.SIGINT) == self._handle:     # nobody replaced it meanwhile
+                previous = self._previous if self._previous is not None else signal.default_int_handler
+                signal.signal(signal.SIGINT, previous)
+
+
+def _sentence(text: str) -> str:
+    """`text` ending with a full stop (log messages that go on after it)."""
+    text = text.rstrip()
+    return text if text.endswith((".", "!", "?")) else f"{text}."
 
 
 def _blocked_copy(exc: BaseException) -> EmailPathUnavailableError:

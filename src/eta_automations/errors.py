@@ -167,7 +167,13 @@ class InvoiceSendError(ServiceError):
 
 
 class EmailPathUnavailableError(InvoiceSendError):
-    """No invoice e-mail can be sent this run (04b §6.1)."""
+    """No invoice e-mail can be sent this run (04b §6.1).
+
+    `recovery_file_unusable` is True when the cause is a template_swap recovery file that this company cannot use: it
+    belongs to another QuickBooks company, or it cannot be read (review fix NEW-03). It says nothing about this
+    company's template, so only a run that e-mails through template_swap must stop for it."""
+
+    recovery_file_unusable: bool = False
 
 
 class TemplateRestoreError(EmailPathUnavailableError):

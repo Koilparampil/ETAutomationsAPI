@@ -42,3 +42,15 @@ def test_write_probe_docs_do_not_promise_that_prefs_roundtrip_can_undo_everythin
     e_mail_steps = README.split("**6. E-mail verification**", 1)[1].split("\n**7.", 1)[0]
     step = e_mail_steps.split("1. `eta probe qbo --prefs-roundtrip`", 1)[1].split("\n2. ", 1)[0]
     assert "QB_SANDBOX=true" in step and "--yes" in step                 # sandbox first, then --yes on production
+
+
+def test_ctrl_c_safety_note_is_about_one_ctrl_c_and_says_what_a_second_one_does() -> None:
+    """NEW-01: the safety note promised that Ctrl+C never splits a notice. That holds for the program's own stop: one
+    Ctrl+C, after which a further Ctrl+C only repeats the stop message. Ending the process otherwise still can."""
+    safety = README.split("## Safety notes", 1)[1].split("\n## ", 1)[0]
+    note = next(item for item in safety.split("\n- ") if "Ctrl+C" in item)
+    assert "never left with the `A` suffix" not in note
+    assert "do not press Ctrl+C again" in note and "only repeats" in note
+    assert "closing the window" in note.lower() and "half-recorded" in note
+    notes = (REPO_ROOT / "IMPLEMENTATION_NOTES.md").read_text(encoding="utf-8")
+    assert "Ctrl+C never splits a notice" not in notes

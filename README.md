@@ -473,7 +473,7 @@ as the original tool. A dry run writes none of them; the plan report shows what 
 | File | Who/what it is for | Entry |
 |---|---|---|
 | `Send2Bindu.csv` | Invoices below `ETA_MIN_INVOICE_AMOUNT` | CSV row `doc_number, amount, customer_name` |
-| `Send2Ben.txt` | Both notices already sent (DocNumber ends in `AA`, or VShip shows `NOTIF #2`, or an earlier row of the same booking in this run sends the second notice) | `{doc_number}` |
+| `Send2Ben.txt` | Both notices already sent (DocNumber ends in `AA`, or VShip shows `NOTIF #2`, or an earlier row of the same booking in this run sent the second notice; such a line is written only once that e-mail went out) | `{doc_number}` |
 | `Send2Accounting.txt` | Partially paid invoice with a TR/SWB note | `{doc_number} - is partially paid and has a TR/SWB note` |
 | `PotentialCustomsHold.txt` | MSC shows a possible customs hold (no e-mail sent) | `[ERROR] #{doc_number} -  Possible Customs Hold.` |
 | `Failed_To_Process.txt` | Every row that needs a person (below) | First line, then the error text and a blank line where shown |
@@ -491,11 +491,11 @@ as the original tool. A dry run writes none of them; the plan report shows what 
 | `[ERROR] #{doc} -  Can't determine ETA.` | The carrier has no usable ETA yet (two spaces after the dash, as in the original) |
 | `[ERROR] #{doc} - Unexpected error during carrier lookup.` | Unexpected failure; the log has the details |
 | `[ERROR] #{doc} - VShip notification lookup failed, nothing sent` | Only with `ETA_ON_NOTIF_LOOKUP_ERROR=fail` |
-| `[SKIP] #{doc} - Done in the last week` | A notice was sent within the last 7 days, or an earlier row of the same booking (e.g. `X` before `X A`) sends one in this run |
+| `[SKIP] #{doc} - Done in the last week` | A notice was sent within the last 7 days, or an earlier row of the same booking (e.g. `X` before `X A`) sent one in this run (written only once that e-mail went out) |
 | `[SKIP] #{doc} - not found in QuickBooks` | No invoice with exactly this DocNumber |
 | `[SKIP] #{doc} - duplicate row in input file (line {n})` | The same DocNumber appeared earlier in the file; only the first row was processed |
 | `[SKIP] #{doc} - already e-mailed today at {HH:MM} (ledger); use --force to resend` | This invoice was already e-mailed today, or an e-mail to it today may have gone out (outcome unknown) (see [Troubleshooting](#troubleshooting)) |
-| `[ERROR] #{doc} - QB Invoice Processing Error, No Email Sent` | A QuickBooks step (or the TR/SWB check) failed; no e-mail went out — unless the error text says the e-mail **outcome is unknown** (a timeout or server error after the request went out): then the e-mail may have arrived, so check the invoice in QuickBooks (or the mailbox's Sent Items for `graph`/`smtp`) before the next run. A re-run the same day skips such an invoice until you pass `--force` |
+| `[ERROR] #{doc} - QB Invoice Processing Error, No Email Sent` | A QuickBooks step (or the TR/SWB check) failed; no e-mail went out — unless the error text says the e-mail **outcome is unknown** (a timeout or server error after the request went out): then the e-mail may have arrived, so check the invoice in QuickBooks (or the mailbox's Sent Items for `graph`/`smtp`) before the next run. A re-run the same day skips such an invoice until you pass `--force`. With the text `not processed: #X (same booking) was to give this booking's notice in this run, but its e-mail was not confirmed as sent`, nothing was changed for this row: the booking gets one notice per run, the earlier row `X` was to send it and failed (its own entry says why). Run the file again once `X` is fixed |
 | `[ERROR] #{doc} - Note Write Error, QB Invoice Processing Successful` | QuickBooks (and the e-mail, if one was due) succeeded; the VShip note was not written |
 | `[ERROR] #{doc} - Booking ETA Change Failed, QB Invoice Processing Successful` | Everything succeeded except the VShip expected-arrival date |
 
@@ -533,11 +533,13 @@ the run report.
 | `[SKIP] #<doc> - already e-mailed today at <HH:MM> (ledger); use --force to resend` | The ledger in `ETA_STATE_DIR` shows that this invoice's e-mail already went out today (for example in an earlier run that was interrupted), or that a send today ended with "outcome unknown" and may have gone out. Check the customer's e-mail or QuickBooks before you consider `--force`; it would send the e-mail again |
 | `The template_swap e-mail method has not been verified for this company…` | Run the e-mail verification (`eta probe qbo --send-test --invoice <test invoice>`). Until then e-mail rows fail with `QB Invoice Processing Error, No Email Sent` and the run exits with code 4 |
 | A run was killed while sending | The next real run (not a dry run) restores the QuickBooks e-mail template subject before its prompt, whatever `QB_EMAIL_STRATEGY` is and also with `--no-email` or nothing to e-mail; `eta probe qbo --restore-template` does only that. A dry run only warns |
+| `recovery file belongs to another QuickBooks company: …` / `The e-mail template recovery file … cannot be read` (or `is not valid JSON`, `has an unexpected format`, `has no original subject`) | `qbo_email_template_recovery.json` in `ETA_STATE_DIR` was left by a run on another company (e.g. the sandbox before switching `QB_SANDBOX` off), or is damaged. A run that e-mails nothing through `template_swap` (`graph`/`smtp`, `--no-email`, nothing to e-mail) only logs this as a WARNING and ends normally (exit code 0); a `template_swap` run with e-mails sends none of them (exit code 4). Restore the other company's subject with `eta probe qbo --restore-template` and that company's settings, or check the invoice e-mail subject in QuickBooks (Settings → Account and settings → Sales → Messages); then delete the file |
 | `The QuickBooks invoice e-mail template must be restored by hand: …` (exit code 4) | Restoring the company-wide invoice e-mail subject failed after a send. Set the subject back as the message says (or run `eta probe qbo --restore-template` once QuickBooks answers again). The invoice being e-mailed at that moment did get its e-mail and its VShip note; the run's other e-mail rows failed with `QB Invoice Processing Error, No Email Sent` and are e-mailed by the next run |
 | `Another ETAutomationsAPI run is in progress (lock: …)` | Wait for the other run. The lock is released by the operating system when that process ends, so a leftover `run.lock` file is harmless |
 | `Missing required settings: …` / `<NAME> must be …` / `Settings file not found: …` / `Cannot read the settings file …: save it as UTF-8 text` | Fix `.env` (or the `--env-file` path) as the message says; save it as UTF-8 |
 | `No input file given and no GUI available — pass the CSV path: eta run <file.csv>` | Tkinter is not available: pass the file on the command line |
 | Ctrl+C at the `[y/N]` prompt or at the `eta qbo-auth` paste prompt | One Ctrl+C ends the program (exit code 3); nothing has been changed at that point. On a Windows console this is not verified yet: if the window does not close, press Enter |
+| `Stopping (Ctrl+C): finishing the changes already started for <n> invoice(s). Please wait - do not press Ctrl+C again.` | Ctrl+C while changes were being applied. Wait: the program finishes what it started (see [Safety notes](#safety-notes)), prints the summary and ends with exit code 3. Further Ctrl+C presses only repeat this line; run the file again afterwards |
 
 ## Safety notes
 
@@ -546,10 +548,15 @@ the run report.
   with sandbox keys) and with `--dry-run` first, and start live use with `--limit` or `--only`.
 - Nothing is written before the confirmation, except the repair of a QuickBooks e-mail template subject left
   modified by a crashed run. Without a terminal and without `--yes` the run aborts.
-- Ctrl+C while the changes are applied lets every write that has started finish, then stops. An invoice is
-  never left with the `A` suffix but no e-mail, or e-mailed without its VShip `NOTIF` note: the suffix is put
-  back, or the note is written, first (a failure there is written to `Failed_To_Process.txt`). The report marks
-  the unfinished rows `INTERRUPTED`; run the file again to finish them.
+- Ctrl+C while the changes are applied stops the run: it prints `Stopping (Ctrl+C): … do not press Ctrl+C again`
+  at once, starts nothing new and lets every write that has started finish. An e-mail still waiting for its turn
+  (`template_swap` sends one at a time) is not sent. A notice is recorded twice, as the `A` suffix and the VShip
+  `NOTIF` note, and the run does not stop between the two: an invoice whose suffix is set but whose e-mail was not
+  sent gets its old number back, and an e-mailed invoice still gets its note (a failure there is written to
+  `Failed_To_Process.txt`). Pressing Ctrl+C again only repeats the message, so wait for the program to end.
+  Closing the window or killing the process (Task Manager, `kill`) while it finishes can still leave a notice
+  half-recorded: then check the invoices the report shows as unfinished in QuickBooks and VShip. The report
+  marks the unfinished rows `INTERRUPTED`; run the file again to finish them.
 - A send that may have reached QuickBooks or the mail server is never retried. The ledger blocks a second e-mail
   for the same invoice on the same day, also after a send whose outcome is unknown (the error says
   `outcome unknown`); use `--force` only when you are sure the first one did not arrive. The ledger guards only

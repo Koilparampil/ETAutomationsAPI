@@ -979,7 +979,8 @@ class QboClient:
         (as `eta probe qbo --restore-template`): restore the invoice e-mail subject a crashed template_swap run left in
         `<state_dir>/qbo_email_template_recovery.json` and delete the file. True when a recovery file was handled,
         False when there was nothing to do. Raises TemplateRestoreError (with the manual instructions) or
-        EmailPathUnavailableError (another company's file); RuntimeError on a read-only client."""
+        EmailPathUnavailableError (another company's file); RuntimeError on a read-only client. An error about the file
+        itself (another company's, unreadable, no original subject) has `recovery_file_unusable` set (NEW-03)."""
         self._ensure_writable()
         emailer = self._template_recovery()
         return False if emailer is None else await emailer.recover()
@@ -1015,7 +1016,12 @@ class QboClient:
         try:
             await self.recover_email_template()
         except Exception as exc:  # noqa: BLE001 - cleanup must not raise; the instructions are logged
-            log.error("The QuickBooks invoice e-mail subject could not be restored at shutdown: %s", exc)
+            if getattr(exc, "recovery_file_unusable", False):
+                # NEW-03: another company's file, or an unreadable one — not a sign that this company's template is
+                # broken; a template_swap run stops its e-mails for it in its preflight.
+                log.warning("The QuickBooks e-mail template recovery file was left as it is at shutdown: %s", exc)
+            else:
+                log.error("The QuickBooks invoice e-mail subject could not be restored at shutdown: %s", exc)
 
     async def send_invoice(self, inv: InvoiceSnapshot, *, subject: str) -> SendReceipt:
         """E-mail the invoice with this exact subject through the configured strategy (04 §6.6, 04b)."""
