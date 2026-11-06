@@ -1,0 +1,22 @@
+{
+ "message":"SUCCESS",
+ "shipment":{
+  "id":501301,
+  "reference":null,
+  "booking_number":"NAM7654321",
+  "container_number":null,
+  "container_count":0,
+  "carrier":{"scac":"CMDU","name":"CMA CGM"},
+  "status":"UNTRACKED",
+  "route":null,
+  "containers":[],
+  "tokens":{"map":"00000000-0000-0000-0000-000000000000"},
+  "followers":[],
+  "tags":[],
+  "creator":{"name":"API User","email":"ops@example.com"},
+  "created_at":"2026-11-05 09:00:00",
+  "updated_at":"2026-11-05 09:00:00",
+  "checked_at":"2026-11-05 09:05:00",
+  "discarded_at":null
+ }
+}

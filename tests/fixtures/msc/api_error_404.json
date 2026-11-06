@@ -1,0 +1,3 @@
+{"httpMethod": "GET", "requestUri": "https://example.invalid/dpo/trackandtrace/v2.2/events?carrierBookingReference=EBKG00000001",
+ "errors": [{"reason": "Not Found", "message": "No events found for the given reference"}], "statusCode": 404,
+ "statusCodeText": "NotFound", "errorDateTime": "2026-11-05T09:30:00Z"}

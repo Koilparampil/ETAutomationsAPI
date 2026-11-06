@@ -1,0 +1,17 @@
+{
+ "message":"SUCCESS",
+ "shipments":[
+  {
+   "id":501234,
+   "reference":null,
+   "booking_number":"EBKG12345678",
+   "container_number":null,
+   "container_count":2,
+   "carrier":{"scac":"MSCU","name":"MSC"},
+   "status":"SAILING",
+   "created_at":"2026-10-16 09:00:00",
+   "updated_at":"2026-11-04 06:10:00"
+  }
+ ],
+ "meta":{"more":false,"total":1}
+}

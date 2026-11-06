@@ -1,0 +1,4 @@
+{
+ "message":"ALREADY_EXISTS",
+ "shipment":{"id":501234,"reference":null,"booking_number":"EBKG12345678","container_number":null}
+}

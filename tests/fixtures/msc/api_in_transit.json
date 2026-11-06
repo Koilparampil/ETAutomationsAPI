@@ -1,0 +1,15 @@
+[
+ {"eventType": "TRANSPORT", "transportEventTypeCode": "ARRI", "eventClassifierCode": "EST", "description": "Estimated Time of Arrival",
+  "eventId": "EST2026-11-12T06:00:00:00+00:00", "eventDateTime": "2026-11-12T06:00:00Z", "eventCreatedDateTime": "2026-11-01T10:00:00Z",
+  "transportCall": {"transportCallID": "GHTEM0001", "unLocationCode": "GHTEM", "facilityTypeCode": "POTE", "modeOfTransport": "VESSEL",
+                    "vessel": {"vesselIMONumber": "9000001", "vesselName": "MSC EXAMPLE"}},
+  "documentReferences": [{"documentReferenceType": "BKG", "documentReferenceValue": "EBKG12345678"}], "references": []},
+ {"eventType": "TRANSPORT", "transportEventTypeCode": "DEPA", "eventClassifierCode": "ACT", "description": "Vessel Departure",
+  "eventId": "ACT2026-10-20T18:00:00:00-04:00", "eventDateTime": "2026-10-20T18:00:00.0000000+00:00", "eventCreatedDateTime": "2026-10-20T19:00:00.0000000+00:00",
+  "transportCall": {"transportCallID": "USNYC0001", "unLocationCode": "USNYC", "facilityTypeCode": "POTE", "modeOfTransport": "VESSEL"}, "references": []},
+ {"eventType": "EQUIPMENT", "equipmentEventTypeCode": "LOAD", "eventClassifierCode": "ACT", "description": "Export Loaded on Vessel",
+  "eventId": "1000000003", "eventDateTime": "2026-10-20T09:15:00Z", "eventCreatedDateTime": "2026-10-20T09:20:00Z",
+  "equipmentReference": "MSCU1111111", "emptyIndicatorCode": "LADEN",
+  "transportCall": {"transportCallID": "USNYC0001", "unLocationCode": "USNYC", "facilityTypeCode": "POTE", "modeOfTransport": "VESSEL"},
+  "eventLocation": {"locationName": "NEW YORK", "unLocationCode": "USNYC"}, "seals": [], "references": []}
+]

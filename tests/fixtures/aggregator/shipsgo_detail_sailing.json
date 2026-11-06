@@ -1,0 +1,67 @@
+{
+ "message":"SUCCESS",
+ "shipment":{
+  "id":501234,
+  "reference":null,
+  "booking_number":"EBKG12345678",
+  "container_number":null,
+  "container_count":2,
+  "carrier":{"scac":"MSCU","name":"MSC"},
+  "status":"SAILING",
+  "route":{
+   "port_of_loading":{
+    "location":{"code":"ITGOA","name":"Genoa","timezone":"Europe/Rome","country":{"code":"IT","name":"Italy"}},
+    "date_of_loading":"2026-10-20T08:00:00Z",
+    "date_of_loading_initial":"2026-10-19T08:00:00Z"
+   },
+   "ts_count":1,
+   "port_of_discharge":{
+    "location":{"code":"USNYC","name":"New York","timezone":"America/New_York","country":{"code":"US","name":"United States"}},
+    "date_of_discharge":"2026-11-12T18:00:00Z",
+    "date_of_discharge_initial":"2026-11-10T18:00:00Z",
+    "date_of_discharge_predicted":"2026-11-13T15:00:00Z"
+   },
+   "transit_time":24,
+   "transit_percentage":60,
+   "co2_emission":1.9
+  },
+  "containers":[
+   {
+    "number":"MEDU1234567",
+    "status":"SAILING",
+    "size":40,
+    "type":"HC",
+    "movements":[
+     {"event":"EMSH","status":"ACT","location":{"code":"ITGOA","name":"Genoa","timezone":"Europe/Rome","country":{"code":"IT","name":"Italy"}},"timestamp":"2026-10-15T07:00:00Z","vessel":null,"voyage":null},
+     {"event":"GTIN","status":"ACT","location":{"code":"ITGOA","name":"Genoa","timezone":"Europe/Rome","country":{"code":"IT","name":"Italy"}},"timestamp":"2026-10-17T12:30:00Z","vessel":null,"voyage":null},
+     {"event":"LOAD","status":"ACT","location":{"code":"ITGOA","name":"Genoa","timezone":"Europe/Rome","country":{"code":"IT","name":"Italy"}},"timestamp":"2026-10-20T08:00:00Z","vessel":{"imo":9000011,"name":"MSC FEEDER"},"voyage":"FA642W"},
+     {"event":"DEPA","status":"ACT","location":{"code":"ITGOA","name":"Genoa","timezone":"Europe/Rome","country":{"code":"IT","name":"Italy"}},"timestamp":"2026-10-20T20:00:00Z","vessel":{"imo":9000011,"name":"MSC FEEDER"},"voyage":"FA642W"},
+     {"event":"ARRV","status":"ACT","location":{"code":"ESVLC","name":"Valencia","timezone":"Europe/Madrid","country":{"code":"ES","name":"Spain"}},"timestamp":"2026-10-22T05:00:00Z","vessel":{"imo":9000011,"name":"MSC FEEDER"},"voyage":"FA642W"},
+     {"event":"DISC","status":"ACT","location":{"code":"ESVLC","name":"Valencia","timezone":"Europe/Madrid","country":{"code":"ES","name":"Spain"}},"timestamp":"2026-10-22T11:00:00Z","vessel":{"imo":9000011,"name":"MSC FEEDER"},"voyage":"FA642W"},
+     {"event":"LOAD","status":"ACT","location":{"code":"ESVLC","name":"Valencia","timezone":"Europe/Madrid","country":{"code":"ES","name":"Spain"}},"timestamp":"2026-10-26T09:00:00Z","vessel":{"imo":9000022,"name":"MSC MOTHER"},"voyage":"UX643A"},
+     {"event":"DEPA","status":"ACT","location":{"code":"ESVLC","name":"Valencia","timezone":"Europe/Madrid","country":{"code":"ES","name":"Spain"}},"timestamp":"2026-10-26T22:00:00Z","vessel":{"imo":9000022,"name":"MSC MOTHER"},"voyage":"UX643A"},
+     {"event":"ARRV","status":"EST","location":{"code":"USNYC","name":"New York","timezone":"America/New_York","country":{"code":"US","name":"United States"}},"timestamp":"2026-11-12T12:30:00Z","vessel":{"imo":9000022,"name":"MSC MOTHER"},"voyage":"UX643A"},
+     {"event":"DISC","status":"EST","location":{"code":"USNYC","name":"New York","timezone":"America/New_York","country":{"code":"US","name":"United States"}},"timestamp":"2026-11-12T18:00:00Z","vessel":{"imo":9000022,"name":"MSC MOTHER"},"voyage":"UX643A"}
+    ]
+   },
+   {
+    "number":"MEDU7654321",
+    "status":"SAILING",
+    "size":40,
+    "type":"HC",
+    "movements":[
+     {"event":"LOAD","status":"ACT","location":{"code":"ESVLC","name":"Valencia","timezone":"Europe/Madrid","country":{"code":"ES","name":"Spain"}},"timestamp":"2026-10-30T09:00:00Z","vessel":{"imo":9000033,"name":"MSC SECOND"},"voyage":"UX645A"},
+     {"event":"ARRV","status":"EST","location":{"code":"USNYC","name":"New York","timezone":"America/New_York","country":{"code":"US","name":"United States"}},"timestamp":"2026-11-14T11:00:00Z","vessel":{"imo":9000033,"name":"MSC SECOND"},"voyage":"UX645A"}
+    ]
+   }
+  ],
+  "tokens":{"map":"00000000-0000-0000-0000-000000000000"},
+  "followers":[],
+  "tags":[],
+  "creator":{"name":"API User","email":"ops@example.com"},
+  "created_at":"2026-10-16 09:00:00",
+  "updated_at":"2026-11-04 06:10:00",
+  "checked_at":"2026-11-05 03:00:00",
+  "discarded_at":null
+ }
+}

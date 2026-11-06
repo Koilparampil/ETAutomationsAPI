@@ -1,0 +1,10 @@
+{"events": [
+  {"eventID": "T2", "eventType": "TRANSPORT", "eventClassifierCode": "EST",
+   "eventDateTime": "2026-11-20T09:00:00-05:00", "eventCreatedDateTime": "2026-11-02T15:00:00Z",
+   "transportEventTypeCode": "ARRI",
+   "transportCall": {"transportCallID": "TC-NYC-07", "modeOfTransport": "VESSEL", "UNLocationCode": "USNYC",
+                     "facilityCode": "APMT", "facilityTypeCode": "POTE", "importVoyageNumber": "444W",
+                     "transportCallSequenceNumber": 2,
+                     "vessel": {"vesselIMONumber": "9778824", "vesselName": "SYNTHETIC ATLANTIC"}},
+   "documentReferences": [{"documentReferenceType": "BKG", "documentReferenceValue": "210000007"}]}
+]}

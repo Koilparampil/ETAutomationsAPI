@@ -1,0 +1,158 @@
+[
+  {
+    "transportEventTypeCode": "ARRI",
+    "transportCall": {
+      "transportCallID": "CXXXXXXXXX",
+      "carrierServiceCode": null,
+      "exportVoyageNumber": null,
+      "importVoyageNumber": "1234W",
+      "facilityCodeListProvider": null,
+      "modeOfTransport": "VESSEL",
+      "unLocationCode": "CXXXX",
+      "facilityCode": null,
+      "facilityTypeCode": "POTE",
+      "otherFacility": null,
+      "vessel": {
+        "vesselIMONumber": "9687540",
+        "vesselCallSignNumber": null,
+        "vesselOperatorCarrierCode": null,
+        "vesselOperatorCarrierCodeList": null,
+        "vesselName": "COCHRANE",
+        "vesselFlag": null
+      }
+    },
+    "documentReferences": [
+      {
+        "documentReferenceType": "BKG",
+        "documentReferenceValue": "177123456789123"
+      },
+      {
+        "documentReferenceType": "TRD",
+        "documentReferenceValue": "MEDUXX123456"
+      }
+    ],
+    "description": "Estimated Time of Arrival",
+    "eventCreatedDateTime": "2022-12-26T04:00:00Z",
+    "references": [],
+    "eventType": "TRANSPORT",
+    "eventId": "EST2022-12-26T04:00:00:00-03:00",
+    "eventDateTime": "2022-12-26T04:00:00Z",
+    "eventClassifierCode": "EST"
+  },
+  {
+    "description": "Full Transshipment Discharged",
+    "eventType": "EQUIPMENT",
+    "equipmentEventTypeCode": "DISC",
+    "equipmentReference": "MSCU1234567",
+    "ISOEquipmentCode": "4310",
+    "emptyIndicatorCode": "LADEN",
+    "transportCall": {
+      "transportCallID": "KRPXXXX1234",
+      "carrierServiceCode": null,
+      "exportVoyageNumber": null,
+      "importVoyageNumber": "UK244A",
+      "unLocationCode": "KRPUS",
+      "facilityCode": "PNP",
+      "facilityCodeListProvider": "SMDG",
+      "facilityTypeCode": "POTE",
+      "otherFacility": null,
+      "modeOfTransport": "VESSEL",
+      "vessel": {
+        "vesselIMONumber": "9400289",
+        "vesselName": "NAVARINO",
+        "vesselFlag": null,
+        "vesselCallSignNumber": null,
+        "vesselOperatorCarrierCode": null,
+        "vesselOperatorCarrierCodeList": null
+      }
+    },
+    "documentReferences": [
+      {
+        "documentReferenceType": "BKG",
+        "documentReferenceValue": "177XXXXXXX12345"
+      },
+      {
+        "documentReferenceType": "TRD",
+        "documentReferenceValue": "MEDXXX123456"
+      }
+    ],
+    "eventLocation": {
+      "locationName": "BUSAN",
+      "latitude": null,
+      "longitude": null,
+      "unLocationCode": "KRPUS",
+      "facilityCode": "PNP",
+      "facilityCodeListProvider": "SMDG",
+      "address": null
+    },
+    "seals": [
+      {
+        "sealNumber": "FX12345678",
+        "sealSource": "CAR"
+      }
+    ],
+    "eventId": "1078740398",
+    "eventDateTime": "2022-11-17T08:50:00Z",
+    "eventClassifierCode": "ACT",
+    "eventCreatedDateTime": "2022-11-17T08:50:00Z",
+    "references": []
+  },
+  {
+    "description": "Export Loaded on Vessel",
+    "eventType": "EQUIPMENT",
+    "equipmentEventTypeCode": "LOAD",
+    "equipmentReference": "MSCU1234568",
+    "ISOEquipmentCode": "4310",
+    "emptyIndicatorCode": "LADEN",
+    "transportCall": {
+      "transportCallID": "CNXXXXX123X",
+      "carrierServiceCode": null,
+      "exportVoyageNumber": "UK123A",
+      "importVoyageNumber": null,
+      "unLocationCode": "CNSHA",
+      "facilityCode": null,
+      "facilityCodeListProvider": null,
+      "facilityTypeCode": "POTE",
+      "otherFacility": null,
+      "modeOfTransport": "VESSEL",
+      "vessel": {
+        "vesselIMONumber": "9400289",
+        "vesselName": "NAVARINO",
+        "vesselFlag": null,
+        "vesselCallSignNumber": null,
+        "vesselOperatorCarrierCode": null,
+        "vesselOperatorCarrierCodeList": null
+      }
+    },
+    "documentReferences": [
+      {
+        "documentReferenceType": "BKG",
+        "documentReferenceValue": "177XXXXXXX12345"
+      },
+      {
+        "documentReferenceType": "TRD",
+        "documentReferenceValue": "MEDXXX123456"
+      }
+    ],
+    "eventLocation": {
+      "locationName": "SHANGHAI",
+      "latitude": null,
+      "longitude": null,
+      "unLocationCode": "CNSHA",
+      "facilityCode": null,
+      "facilityCodeListProvider": null,
+      "address": null
+    },
+    "seals": [
+      {
+        "sealNumber": "FX12345678",
+        "sealSource": "CAR"
+      }
+    ],
+    "eventId": "1075525830",
+    "eventDateTime": "2022-11-10T10:04:00Z",
+    "eventClassifierCode": "ACT",
+    "eventCreatedDateTime": "2022-11-10T10:04:00Z",
+    "references": []
+  }
+]

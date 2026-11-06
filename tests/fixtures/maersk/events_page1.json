@@ -1,0 +1,17 @@
+{"events": [
+  {"eventID": "T1", "eventType": "TRANSPORT", "eventClassifierCode": "ACT",
+   "eventDateTime": "2026-10-28T20:00:00+08:00", "eventCreatedDateTime": "2026-10-28T12:30:00Z",
+   "transportEventTypeCode": "DEPA",
+   "transportCall": {"transportCallID": "TC-NGB-07", "modeOfTransport": "VESSEL", "UNLocationCode": "CNNGB",
+                     "facilityCode": "NBCT", "facilityTypeCode": "POTE", "exportVoyageNumber": "444E",
+                     "transportCallSequenceNumber": 1, "location": {"locationName": "Ningbo", "UNLocationCode": "CNNGB"},
+                     "vessel": {"vesselIMONumber": "9778824", "vesselName": "SYNTHETIC ATLANTIC"}},
+   "documentReferences": [{"documentReferenceType": "BKG", "documentReferenceValue": "210000007"}]},
+  {"eventID": "E1", "eventType": "EQUIPMENT", "eventClassifierCode": "ACT",
+   "eventDateTime": "2026-10-28T09:10:00+08:00", "eventCreatedDateTime": "2026-10-28T01:15:00Z",
+   "equipmentEventTypeCode": "LOAD", "equipmentReference": "MSKU7777777", "emptyIndicatorCode": "LADEN",
+   "eventLocation": {"UNLocationCode": "CNNGB", "facilityCode": "NBCT"},
+   "transportCall": {"transportCallID": "TC-NGB-07", "modeOfTransport": "VESSEL", "UNLocationCode": "CNNGB",
+                     "facilityCode": "NBCT", "facilityTypeCode": "POTE", "transportCallSequenceNumber": 1,
+                     "vessel": {"vesselIMONumber": "9778824", "vesselName": "SYNTHETIC ATLANTIC"}}}
+]}

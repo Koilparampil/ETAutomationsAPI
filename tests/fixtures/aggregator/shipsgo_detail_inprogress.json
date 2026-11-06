@@ -1,0 +1,22 @@
+{
+ "message":"SUCCESS",
+ "shipment":{
+  "id":501300,
+  "reference":null,
+  "booking_number":"EBKG87654321",
+  "container_number":null,
+  "container_count":0,
+  "carrier":{"scac":"MSCU","name":"MSC"},
+  "status":"INPROGRESS",
+  "route":null,
+  "containers":[],
+  "tokens":{"map":"00000000-0000-0000-0000-000000000000"},
+  "followers":[],
+  "tags":[],
+  "creator":{"name":"API User","email":"ops@example.com"},
+  "created_at":"2026-11-05 09:00:00",
+  "updated_at":"2026-11-05 09:00:00",
+  "checked_at":null,
+  "discarded_at":null
+ }
+}
