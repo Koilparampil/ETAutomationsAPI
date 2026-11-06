@@ -26,8 +26,17 @@ def _expected_message(state_dir: Path) -> str:
 
 
 def test_lock_writes_pid_and_start_time(tmp_path: Path) -> None:
+    """POSIX: flock is advisory, so the file can be read while the lock is held. Windows: msvcrt.locking is mandatory,
+    so byte 0 (the locked placeholder) cannot be read until the lock is released; the line follows that byte."""
+    path = tmp_path / LOCK_FILE_NAME
     with run_lock(tmp_path):
-        content = (tmp_path / LOCK_FILE_NAME).read_text(encoding="ascii")
+        if os.name == "nt":
+            with pytest.raises(PermissionError):
+                path.read_bytes()
+        else:
+            content = path.read_text(encoding="ascii")
+    if os.name == "nt":
+        content = path.read_text(encoding="ascii")[1:]      # the line stays in the file after the release
     assert re.fullmatch(rf"pid={os.getpid()} started=\d{{4}}-\d\d-\d\dT\d\d:\d\d:\d\d\n", content)
 
 
